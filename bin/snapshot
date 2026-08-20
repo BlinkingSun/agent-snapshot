@@ -1,0 +1,283 @@
+#!/bin/bash
+# snapshot — agent-snapshot writer: backs up SOURCE to the archive host (snap
+# leg) and/or a second host (vault leg).
+#
+#   snapshot            both enabled legs (on-demand)
+#   snapshot snap       rsync hardlink snapshot -> archive host DAS
+#   snapshot vault      compressed dated archive -> vault host
+#
+# Retention is by AGE and per-leg: SNAP_RETENTION days of snapshots,
+# VAULT_RETENTION days of archives.
+# An unreachable target is reported and skipped, never treated as success.
+
+set -uo pipefail
+
+# macOS launchd cannot execute scripts that live inside TCC-protected folders.
+# Scheduled jobs run the installed copy under ~/Library/Application Support.
+# This flag only proves that copy is reachable from launchd — it backs up nothing.
+if [ "${1-}" = "--launchd-ok" ]; then
+  mkdir -p "$HOME/Library/Logs/agent-snapshot"
+  echo "$(date '+%Y-%m-%d %H:%M:%S')  launchd-ok pid=$$" >> "$HOME/Library/Logs/agent-snapshot/launchd-ok.log"
+  exit 0
+fi
+
+CONF="${AGENT_SNAPSHOT_CONF:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/conf/snapshot.conf}"
+[ -f "$CONF" ] || { echo "snapshot: config not found: $CONF (copy conf/snapshot.conf.example)" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+STAMP="$(date +%Y-%m-%d_%H%M%S)"
+LOG="$LOGDIR/$(date +%Y-%m).log"
+mkdir -p "$LOGDIR" "$STAGE"
+
+RC=0
+declare -a RESULTS=()
+
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+die() { log "FATAL: $*"; exit 1; }
+
+# Single-instance lock so a scheduled run can't collide with an on-demand one.
+LOCK="$STAGE/.lock"
+exec 9>"$LOCK"
+if ! flock -n 9 2>/dev/null; then
+  # macOS has no flock(1); fall back to a PID file.
+  if [ -f "$STAGE/.pid" ] && kill -0 "$(cat "$STAGE/.pid" 2>/dev/null)" 2>/dev/null; then
+    log "another snapshot run is already active (pid $(cat "$STAGE/.pid")) — exiting"
+    exit 0
+  fi
+fi
+echo $$ > "$STAGE/.pid"
+trap 'rm -f "$STAGE/.pid"' EXIT
+
+[ -d "$SOURCE" ] || die "source $SOURCE does not exist"
+
+# Build rsync/tar exclude arguments from the configured list.
+RSYNC_EX=(); TAR_EX=()
+for e in "${EXCLUDES[@]}"; do
+  RSYNC_EX+=(--exclude "$e")
+  TAR_EX+=(--exclude "$e")
+done
+
+reachable() {  # reachable <ssh-target>
+  ssh $SSH_OPTS "$1" 'exit 0' >/dev/null 2>&1
+}
+
+# Remote path for SNAP_DIR: absolute stays absolute, relative goes under remote $HOME.
+snap_path() {
+  if [[ "$SNAP_DIR" = /* ]]; then
+    printf '%s' "$SNAP_DIR"
+  else
+    printf '~/%s' "$SNAP_DIR"
+  fi
+}
+
+# Free space on the *destination volume* (the DAS, not the archive host's boot disk).
+snap_free_gb() {
+  local path out
+  path="$(snap_path)"
+  out=$(ssh $SSH_OPTS "$SNAP_SSH" "df -g '$path' 2>/dev/null | awk 'NR==2{print \$4}'" | head -1 | tr -dc "0-9")
+  echo "${out:-0}"
+}
+
+# ---------------------------------------------------------------- snap ------
+backup_snap() {
+  local rdir
+  rdir="$(snap_path)"
+  log "[snap] starting -> $SNAP_SSH:$rdir/$STAMP"
+
+  if ! reachable "$SNAP_SSH"; then
+    log "[snap] UNREACHABLE ($SNAP_SSH) — skipped"
+    RESULTS+=("snap: SKIPPED (unreachable)"); RC=1; return 1
+  fi
+
+  ssh $SSH_OPTS "$SNAP_SSH" "mkdir -p '$rdir'" || {
+    log "[snap] could not create remote dir"; RESULTS+=("snap: FAILED (mkdir)"); RC=1; return 1; }
+
+  local freegb
+  freegb=$(snap_free_gb)
+  log "[snap] free space: ${freegb}G (floor ${SNAP_MIN_FREE_GB}G)"
+  if [ "${freegb:-0}" -lt "$SNAP_MIN_FREE_GB" ]; then
+    log "[snap] below floor — pruning oldest snapshots to make room"
+    prune_snap_to_fit
+    freegb=$(snap_free_gb)
+    if [ "${freegb:-0}" -lt "$SNAP_MIN_FREE_GB" ]; then
+      log "[snap] STILL below floor (${freegb}G) — aborting"
+      RESULTS+=("snap: FAILED (low disk ${freegb}G)"); RC=1; return 1
+    fi
+  fi
+
+  # Newest existing snapshot becomes the hardlink base, so unchanged files cost nothing.
+  local prev
+  prev=$(ssh $SSH_OPTS "$SNAP_SSH" "ls -1 '$rdir' 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_' | sort | tail -1")
+  local linkdest=()
+  if [ -n "$prev" ]; then
+    linkdest=(--link-dest="../$prev")
+    log "[snap] hardlinking unchanged files against $prev"
+  else
+    log "[snap] no previous snapshot — this is a full baseline"
+  fi
+
+  # -rlptD rather than -a: skips owner/group, which usually differ between the
+  # two machines. --delete acts only INSIDE the brand-new dated directory being
+  # built; it never touches previous snapshots (see docs/SAFETY.md).
+  # Remote rsync + --link-dest on a large tree can exhaust default fds
+  # ("Too many open files") and stall. Raise the remote limit for the server.
+  rsync -rlptD --delete ${linkdest[@]+"${linkdest[@]}"} ${RSYNC_EX[@]+"${RSYNC_EX[@]}"} \
+        -e "ssh $SSH_OPTS" \
+        --rsync-path='ulimit -n 65535; rsync' \
+        "$SOURCE/" "$SNAP_SSH:$rdir/$STAMP/" >>"$LOG" 2>&1
+  local rc=$?
+  # 24 = "file vanished during transfer", benign on a live working directory.
+  if [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
+    log "[snap] rsync FAILED (rc=$rc)"; RESULTS+=("snap: FAILED (rsync rc=$rc)"); RC=1; return 1
+  fi
+  [ $rc -eq 24 ] && log "[snap] note: some files vanished mid-transfer (rc=24, benign)"
+
+  ssh $SSH_OPTS "$SNAP_SSH" "cd '$rdir' && rm -f latest && ln -s '$STAMP' latest" 2>/dev/null
+
+  local size
+  size=$(ssh $SSH_OPTS "$SNAP_SSH" "du -sh '$rdir'/'$STAMP' 2>/dev/null | cut -f1")
+  log "[snap] OK — snapshot $STAMP ($size logical)"
+  RESULTS+=("snap: OK ($STAMP, $size)")
+  prune_snap
+  # The archive host owns the replica (primary DAS -> mirror DAS). Kick it so the
+  # copy starts now rather than at the host's next scheduled pass. Do not wait —
+  # a volume replica can outlive this run's lock.
+  if [ -n "${REPLICA_KICK:-}" ]; then
+    if ssh $SSH_OPTS "$SNAP_SSH" "$REPLICA_KICK"; then
+      log "[snap] replica pass started on archive host"
+    else
+      log "[snap] replica kick FAILED — snapshot is still good; archive host schedule will retry"
+    fi
+  fi
+  return 0
+}
+
+prune_snap() {
+  local rdir removed
+  rdir="$(snap_path)"
+  removed=$(ssh $SSH_OPTS "$SNAP_SSH" "
+    cd '$rdir' 2>/dev/null || exit 0
+    n=0
+    for d in \$(ls -1 | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_' | sort); do
+      day=\${d%%_*}
+      age=\$(( ( \$(date +%s) - \$(date -j -f %Y-%m-%d \"\$day\" +%s 2>/dev/null || date -d \"\$day\" +%s 2>/dev/null || echo \$(date +%s)) ) / 86400 ))
+      if [ \"\$age\" -gt $SNAP_RETENTION ]; then rm -rf \"\$d\"; echo \"\$d\"; n=\$((n+1)); fi
+    done")
+  if [ -n "$removed" ]; then
+    log "[snap] pruned (older than ${SNAP_RETENTION}d): $(echo "$removed" | tr '\n' ' ')"
+  else
+    log "[snap] nothing to prune"
+  fi
+}
+
+prune_snap_to_fit() {
+  local rdir
+  rdir="$(snap_path)"
+  ssh $SSH_OPTS "$SNAP_SSH" "
+    cd '$rdir' 2>/dev/null || exit 0
+    list=\$(ls -1 | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_' | sort)
+    count=\$(echo \"\$list\" | grep -c .)
+    if [ \"\$count\" -gt 1 ]; then rm -rf \"\$(echo \"\$list\" | head -1)\"; fi"
+}
+
+# ---------------------------------------------------------------- vault -----
+win_path() { printf '%s' "${VAULT_DIR//\//\\}"; }
+
+backup_vault() {
+  local archive="$STAGE/$STAMP.tar.zst"
+  log "[vault] starting -> $VAULT_SSH:$VAULT_DIR/$STAMP.tar.zst"
+
+  if ! reachable "$VAULT_SSH"; then
+    log "[vault] UNREACHABLE ($VAULT_SSH) — skipped"
+    RESULTS+=("vault: SKIPPED (unreachable)"); RC=1; return 1
+  fi
+
+  log "[vault] compressing $SOURCE ..."
+  tar ${TAR_EX[@]+"${TAR_EX[@]}"} -C "$(dirname "$SOURCE")" -cf - "$(basename "$SOURCE")" 2>>"$LOG" \
+    | zstd -T0 -3 -q -o "$archive" 2>>"$LOG"
+  local prc=$?
+  # Non-empty is not enough: a truncated tar still has bytes and would hash-match
+  # on transfer, producing a silently corrupt backup. Fail on any pipeline error...
+  if [ $prc -ne 0 ] || [ ! -s "$archive" ]; then
+    log "[vault] archive creation FAILED (pipeline rc=$prc)"
+    RESULTS+=("vault: FAILED (tar/zstd rc=$prc)"); RC=1
+    rm -f "$archive"; return 1
+  fi
+  # ...and prove the archive decompresses cleanly before we ship it anywhere.
+  if ! zstd -t -q "$archive" 2>>"$LOG"; then
+    log "[vault] archive FAILED integrity test — not transferring"
+    RESULTS+=("vault: FAILED (corrupt archive)"); RC=1
+    rm -f "$archive"; return 1
+  fi
+  log "[vault] archive integrity verified"
+  local human
+  human=$(du -h "$archive" | cut -f1)
+  log "[vault] archive built: $human"
+
+  local localhash
+  localhash=$(shasum -a 256 "$archive" | awk '{print $1}')
+
+  if [ "$VAULT_OS" = "windows" ]; then
+    ssh $SSH_OPTS "$VAULT_SSH" "if not exist \"$(win_path)\" mkdir \"$(win_path)\"" >/dev/null 2>&1
+  else
+    ssh $SSH_OPTS "$VAULT_SSH" "mkdir -p '$VAULT_DIR'" >/dev/null 2>&1
+  fi
+
+  log "[vault] transferring ..."
+  if ! scp -q $SSH_OPTS "$archive" "$VAULT_SSH:$VAULT_DIR/$STAMP.tar.zst" 2>>"$LOG"; then
+    log "[vault] transfer FAILED"; RESULTS+=("vault: FAILED (scp)"); RC=1; rm -f "$archive"; return 1
+  fi
+
+  # Verify the bytes that landed match what we sent, then drop the local copy.
+  local remotehash
+  if [ "$VAULT_OS" = "windows" ]; then
+    remotehash=$(ssh $SSH_OPTS "$VAULT_SSH" "certutil -hashfile \"$(win_path)\\$STAMP.tar.zst\" SHA256" 2>/dev/null \
+                 | sed -n '2p' | tr -d ' \r\n')
+  else
+    remotehash=$(ssh $SSH_OPTS "$VAULT_SSH" "(sha256sum '$VAULT_DIR/$STAMP.tar.zst' 2>/dev/null || shasum -a 256 '$VAULT_DIR/$STAMP.tar.zst') | awk '{print \$1}'" | tr -d ' \r\n')
+  fi
+  if [ "$localhash" != "$remotehash" ]; then
+    log "[vault] CHECKSUM MISMATCH — local=$localhash remote=$remotehash"
+    RESULTS+=("vault: FAILED (checksum)"); RC=1; rm -f "$archive"; return 1
+  fi
+  log "[vault] verified sha256=${localhash:0:16}…"
+  rm -f "$archive"
+
+  log "[vault] OK — archive $STAMP.tar.zst ($human)"
+  RESULTS+=("vault: OK ($STAMP.tar.zst, $human)")
+  prune_vault
+  return 0
+}
+
+prune_vault() {
+  local removed
+  if [ "$VAULT_OS" = "windows" ]; then
+    removed=$(ssh $SSH_OPTS "$VAULT_SSH" "powershell -NoProfile -Command \"\$c=(Get-Date).AddDays(-$VAULT_RETENTION); Get-ChildItem '$(win_path)\\*.tar.zst' | Where-Object { \$_.LastWriteTime -lt \$c } | ForEach-Object { \$_.Name; Remove-Item \$_.FullName -Force }\"" 2>/dev/null | tr -d '\r')
+  else
+    removed=$(ssh $SSH_OPTS "$VAULT_SSH" "find '$VAULT_DIR' -maxdepth 1 -name '*.tar.zst' -mtime +$VAULT_RETENTION -print -delete" 2>/dev/null)
+  fi
+  if [ -n "$removed" ]; then
+    log "[vault] pruned (older than ${VAULT_RETENTION}d): $(echo "$removed" | tr '\n' ' ')"
+  else
+    log "[vault] nothing to prune"
+  fi
+}
+
+# ---------------------------------------------------------------- main ------
+TARGET="${1:-both}"
+log "===== agent-snapshot ($TARGET) run $STAMP ====="
+case "$TARGET" in
+  snap)  [ "$SNAP_ENABLED" = true ] && backup_snap || log "[snap] disabled in conf" ;;
+  vault) [ "$VAULT_ENABLED" = true ] && backup_vault || log "[vault] disabled in conf" ;;
+  both)
+    [ "$SNAP_ENABLED"  = true ] && backup_snap
+    [ "$VAULT_ENABLED" = true ] && backup_vault
+    ;;
+  *) die "unknown target '$TARGET' (use: snap | vault | both)" ;;
+esac
+
+log "----- summary -----"
+for r in ${RESULTS[@]+"${RESULTS[@]}"}; do log "  $r"; done
+log "===== finished (rc=$RC) ====="
+exit $RC

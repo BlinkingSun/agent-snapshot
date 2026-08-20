@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-snapshot.__LEG__</string>
+
+  <!-- The job is `ssh localhost __MODE__` with the dedicated key. The key's
+       forced command routes it into snapshot-dispatch as a child of sshd,
+       which holds Full Disk Access — this is the TCC workaround that lets a
+       scheduled job read protected folders. See docs/DESIGN.md. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-i</string>
+    <string>__HOME__/.ssh/id_ed25519_agent_snapshot</string>
+    <string>-o</string>
+    <string>IdentitiesOnly=yes</string>
+    <string>-o</string>
+    <string>BatchMode=yes</string>
+    <string>-o</string>
+    <string>StrictHostKeyChecking=yes</string>
+    <string>-o</string>
+    <string>ConnectTimeout=15</string>
+    <string>-o</string>
+    <string>PreferredAuthentications=publickey</string>
+    <string>localhost</string>
+    <string>__MODE__</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>__HOUR__</integer>
+    <key>Minute</key>
+    <integer>__MINUTE__</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/agent-snapshot/launchd-__LEG__.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/agent-snapshot/launchd-__LEG__.log</string>
+</dict>
+</plist>

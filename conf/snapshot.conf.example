@@ -1,0 +1,55 @@
+# agent-snapshot configuration — sourced by bin/snapshot
+# Copy to conf/snapshot.conf and edit. Everything about WHERE, WHEN and HOW MUCH
+# lives here; the scripts hold no site details.
+
+# --- What to back up ---------------------------------------------------------
+# Any directory. The whole tree below it is protected (minus EXCLUDES).
+SOURCE="$HOME/Desktop"
+
+# --- Snap leg: dated hardlink snapshots on the archive host's DAS ------------
+# Browsable, deduplicated history: each run creates a new dated directory;
+# unchanged files are hardlinked against the previous snapshot and cost ~nothing.
+SNAP_ENABLED=true
+SNAP_SSH="user@archive-host.local"   # single-machine mode: SNAP_SSH="localhost"
+SNAP_DIR="/Volumes/SnapArchive/agent-snapshot"   # on the DAS, NOT the boot disk
+SNAP_RETENTION=90                    # days of snapshot history kept
+                                     # NOTE: the archive host's mirror prunes at
+                                     # PRUNE_AGE_DAYS (default 100, in engine.py).
+                                     # Keep that ABOVE this value + margin — the
+                                     # mirror must always outlive the primary.
+SNAP_MIN_FREE_GB=50                  # abort/prune floor, measured on the DAS
+
+# --- Vault leg: compressed, checksum-verified archives on a second host ------
+# Independent second copy in a different format on different hardware.
+VAULT_ENABLED=false
+VAULT_SSH="user@vault-host"
+VAULT_OS="posix"                     # posix | windows (hash + prune tooling differ)
+VAULT_DIR="/backups/agent-snapshot"  # windows example: D:/agent-snapshot
+VAULT_RETENTION=5                    # days of archives kept
+
+# --- Plumbing ----------------------------------------------------------------
+STAGE="$HOME/Library/Caches/agent-snapshot"
+LOGDIR="$HOME/Library/Logs/agent-snapshot"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+# Paths (relative to SOURCE root or bare names) excluded from every backup.
+EXCLUDES=(
+  ".DS_Store"
+  # Build output is regenerable by rebuilding and compresses badly. Excluding it
+  # keeps archives small; the files stay on disk so local rebuilds remain instant.
+  "target"
+  ".build"
+  "node_modules"
+  "DerivedData"
+  ".Spotlight-V100"
+  ".fseventsd"
+  ".TemporaryItems"
+  ".DocumentRevisions-V100"
+  ".Trashes"
+)
+
+# Optional: command run ON THE ARCHIVE HOST after a successful snapshot to start
+# its replica pass (primary DAS -> mirror DAS) immediately instead of waiting
+# for the archive host's own 5-minute poll. Empty string disables the kick.
+# Contract: the entrypoint runs correctly with NO arguments (defaults to mirror).
+REPLICA_KICK='nohup "$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'

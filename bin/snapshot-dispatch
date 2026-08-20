@@ -1,0 +1,113 @@
+#!/bin/bash
+# snapshot-dispatch — forced-command dispatcher for the agent-snapshot
+# localhost SSH key.
+#
+# WHY THIS EXISTS
+#   macOS TCC blocks a launchd-spawned process from reading protected folders
+#   (Desktop, Documents, removable volumes). A LaunchAgent running /bin/bash
+#   gets "Operation not permitted" on ls/open/rsync against ~/Desktop while
+#   ~/Library reads fine. If your backup SOURCE lives in a protected folder,
+#   scheduled jobs can never work when launchd invokes bash directly.
+#   sshd DOES hold the necessary access (grant it Full Disk Access once), so
+#   the LaunchAgents ssh to localhost with a dedicated key whose forced
+#   command is this file. The backup therefore executes as a child of sshd
+#   and can read the source. The same pattern runs the replica job on the
+#   archive host, where launchd cannot open USB volumes.
+#
+# CONTRACT
+#   The key's authorized_keys entry pins command="/bin/bash <this file>", so a
+#   client holding the key CANNOT choose what runs. The requested MODE arrives
+#   in SSH_ORIGINAL_COMMAND and is matched against the closed allowlist below.
+#   Anything else is refused. This is also a data-safety property: even a fully
+#   compromised process holding this key can only trigger a backup or a
+#   read-only probe — never a delete, never an arbitrary command.
+#
+# MODES
+#   snap   -> snapshot snap    (hardlink snapshot to the archive host DAS)
+#   vault  -> snapshot vault   (compressed archive to the vault host)
+#   both   -> snapshot both
+#   probe  -> READ-ONLY self-test of source access. Backs nothing up. Safe anytime.
+#
+set -uo pipefail
+
+# sshd hands out a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) with no Homebrew,
+# but the vault leg needs zstd. Supply it here; launchd EnvironmentVariables
+# do not reach jobs routed through sshd.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+APPDIR="$HOME/Library/Application Support/agent-snapshot"
+BIN="$APPDIR/bin/snapshot"
+CONF="$APPDIR/conf/snapshot.conf"
+LOGDIR="$HOME/Library/Logs/agent-snapshot"
+mkdir -p "$LOGDIR"
+DLOG="$LOGDIR/dispatch.log"
+
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$DLOG"; }
+
+MODE="${SSH_ORIGINAL_COMMAND:-}"
+log "request mode=[$MODE] client=[${SSH_CLIENT:-none}] pid=$$"
+
+case "$MODE" in
+  snap|vault|both)
+    log "-> exec snapshot $MODE"
+    exec /bin/bash "$BIN" "$MODE"
+    ;;
+  probe)
+    # Read-only. Proves the scheduled transport can actually reach the backup
+    # SOURCE. Touches nothing, transfers nothing, writes no snapshot.
+    # shellcheck disable=SC1090
+    source "$CONF" 2>/dev/null || { echo "probe: FAIL cannot read $CONF"; exit 1; }
+    SRC="$SOURCE"
+    rc_all=0
+    echo "probe: host=$(hostname -s) uid=$(id -u) parent=$(ps -o comm= -p $PPID 2>/dev/null | tr -d ' ')"
+    echo "probe: PATH=$PATH"
+    echo "probe: zstd=$(command -v zstd || echo MISSING)"
+
+    if ls "$SRC" >/dev/null 2>&1; then
+      echo "probe: T1 readdir $SRC = OK ($(ls "$SRC" | wc -l | tr -d ' ') entries)"
+    else
+      echo "probe: T1 readdir $SRC = FAIL [$(ls "$SRC" 2>&1 | head -1)]"; rc_all=1
+    fi
+
+    PROBE_FILE="$(find "$SRC" -maxdepth 2 -type f -print 2>/dev/null | head -1)"
+    if [ -n "$PROBE_FILE" ] && head -c 32 "$PROBE_FILE" >/dev/null 2>&1; then
+      echo "probe: T2 open file under $SRC = OK"
+    else
+      echo "probe: T2 open file under $SRC = FAIL"; rc_all=1
+    fi
+
+    # Same reader the real job uses, in dry-run mode (-n writes nothing).
+    PROBE_DIR="${PROBE_FILE:+$(dirname "$PROBE_FILE")}"
+    ro=$(/usr/bin/rsync -rn "${PROBE_DIR:-$SRC}/" "$HOME/Library/Caches/agent-snapshot/.probe-dryrun/" 2>&1)
+    if echo "$ro" | grep -qi "not permitted"; then
+      echo "probe: T3 rsync dry-run read of $SRC = FAIL [$(echo "$ro" | head -1)]"; rc_all=1
+    else
+      echo "probe: T3 rsync dry-run read of $SRC = OK"
+    fi
+
+    # Reachability of the enabled targets, no data moved.
+    if [ "${SNAP_ENABLED:-false}" = true ]; then
+      if ssh $SSH_OPTS "$SNAP_SSH" 'exit 0' >/dev/null 2>&1; then
+        echo "probe: T4 archive host reachable = OK"
+      else
+        echo "probe: T4 archive host reachable = FAIL"; rc_all=1
+      fi
+    fi
+    if [ "${VAULT_ENABLED:-false}" = true ]; then
+      if ssh $SSH_OPTS "$VAULT_SSH" 'exit 0' >/dev/null 2>&1; then
+        echo "probe: T5 vault host reachable = OK"
+      else
+        echo "probe: T5 vault host reachable = FAIL"; rc_all=1
+      fi
+    fi
+
+    log "probe finished rc=$rc_all"
+    echo "probe: OVERALL rc=$rc_all"
+    exit $rc_all
+    ;;
+  *)
+    log "REFUSED unknown mode [$MODE]"
+    echo "snapshot-dispatch: refused (allowed: snap | vault | both | probe)" >&2
+    exit 77
+    ;;
+esac
