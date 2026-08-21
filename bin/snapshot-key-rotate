@@ -1,0 +1,1239 @@
+#!/bin/bash
+# snapshot-key-rotate — automated SSH key rotation (writer + replica roles).
+#
+# Safety-critical: append → verify authorized_keys → flip symlink → auth probe
+# → commit state; automatic rollback on auth probe failure.
+# See docs/IMPLEMENTATION-BRIEF.md §4.
+#
+# Exit codes:
+#   0   success
+#   1   rotation/finalize failed (auth probe failure triggers rollback first)
+#   2   usage error / unknown role
+#  75   rotation cutover succeeded (state committed) but legacy authorized_keys
+#       cleanup requires manual operator action — not a rotation failure
+#  79   rotate deferred (snapshot/engine busy lock held)
+set -euo pipefail
+
+# Cutover succeeded; legacy AK hygiene failed — distinct from exit 1 (rotation failed).
+readonly KR_EXIT_LEGACY_CLEANUP=75
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KEY_LIB="$SCRIPT_DIR/snapshot-key-lib.sh"
+if [ ! -r "$KEY_LIB" ]; then
+  echo "snapshot-key-rotate: missing library $KEY_LIB" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$KEY_LIB"
+
+SUBCMD=""
+ROLE=""
+DRY_RUN=0
+FORCE=0
+APPLY_AK=""   # empty = use conf default; 1/0 when flag set
+
+# Role-specific (kr_init_role)
+REGISTRY=""
+STATE_FILE=""
+ROTLOG=""
+KEYS_DIR=""
+STABLE_LINK=""
+AK_FILE=""
+COMMENT_PREFIX=""
+FORCED_CMD=""
+APPDIR=""
+BUSY_LOCK=""
+ROT_LOCK=""
+ROTATION_DAYS=90
+_kr_rotation_lock_held=0
+OVERLAP_HOURS=72
+CONF_APPLY_AK=1
+
+_kr_truthy() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_kr_usage() {
+  cat <<'EOF'
+Usage: snapshot-key-rotate <subcommand> [options]
+
+Subcommands:
+  status          Show registry state, key age, overlap, pending actions
+  bootstrap       Migrate legacy flat key into registry (upgrade path)
+  probe           Run role-appropriate forced-command probe
+  rotate          Generate new key, enter overlap, probe-gated cutover
+  finalize        Remove previous key after overlap (never touches active line)
+  rotate-if-due   Scheduled entry: bootstrap if needed, rotate/finalize when due
+
+Options:
+  --role writer|replica     Role (auto-detected from install paths when omitted)
+  --dry-run                 Print actions without mutating state
+  --apply-authorized-keys   Edit ~/.ssh/authorized_keys (append/remove via library)
+  --no-apply-authorized-keys
+                            Print lines only; symlink never flips until line exists
+  --force                   Skip overlap guard on finalize; skip busy guard on rotate
+
+Default for authorized_keys edits comes from KEY_ROTATION_APPLY_AK in conf (writer)
+or true for replica unless overridden by flags above.
+EOF
+}
+
+_kr_log() {
+  local msg ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  msg="$ts  $*"
+  if [ -n "${ROTLOG:-}" ]; then
+    mkdir -p "$(dirname "$ROTLOG")"
+    printf '%s\n' "$msg" >> "$ROTLOG"
+  fi
+  printf '%s\n' "$msg" >&2
+}
+
+_kr_detect_role() {
+  if [ -f "$HOME/Library/Application Support/agent-snapshot/bin/snapshot-dispatch" ]; then
+    printf '%s\n' writer
+    return 0
+  fi
+  if [ -f "$HOME/Library/AgentSnapshot/mirror.sh" ]; then
+    printf '%s\n' replica
+    return 0
+  fi
+  if [ -e "$HOME/.ssh/id_ed25519_agent_snapshot" ]; then
+    printf '%s\n' writer
+    return 0
+  fi
+  if [ -e "$HOME/.ssh/id_ed25519_agentsnapshot_replica" ]; then
+    printf '%s\n' replica
+    return 0
+  fi
+  return 1
+}
+
+_kr_load_writer_conf() {
+  APPDIR="$(asnap_appdir)"
+  local conf="$APPDIR/conf/snapshot.conf"
+  STAGE=""
+  if [ -f "$conf" ]; then
+    # shellcheck disable=SC1090
+    source "$conf" 2>/dev/null || true
+  fi
+  ROTATION_DAYS=${KEY_ROTATION_DAYS:-90}
+  OVERLAP_HOURS=${KEY_OVERLAP_HOURS:-72}
+  if _kr_truthy "${KEY_ROTATION_APPLY_AK:-true}"; then
+    CONF_APPLY_AK=1
+  else
+    CONF_APPLY_AK=0
+  fi
+  BUSY_LOCK="${STAGE:-$HOME/Library/Caches/agent-snapshot}/.lock"
+  FORCED_CMD="$APPDIR/bin/snapshot-dispatch"
+}
+
+_kr_load_replica_conf() {
+  ROTATION_DAYS=${KEY_ROTATION_DAYS:-90}
+  OVERLAP_HOURS=${KEY_OVERLAP_HOURS:-72}
+  if _kr_truthy "${KEY_ROTATION_APPLY_AK:-true}"; then
+    CONF_APPLY_AK=1
+  else
+    CONF_APPLY_AK=0
+  fi
+  BUSY_LOCK="$HOME/Library/AgentSnapshot/mirror.pid"
+  FORCED_CMD="$HOME/Library/AgentSnapshot/mirror.sh"
+}
+
+_kr_init_role() {
+  local r=$1
+  REGISTRY="$(asnap_registry_dir)"
+  STATE_FILE="$REGISTRY/state.json"
+  ROTLOG="$REGISTRY/rotation.log"
+  ROT_LOCK="$REGISTRY/.rotate.lockdir"
+  KEYS_DIR="$REGISTRY/keys"
+  AK_FILE="$HOME/.ssh/authorized_keys"
+
+  case "$r" in
+    writer)
+      STABLE_LINK="$HOME/.ssh/id_ed25519_agent_snapshot"
+      COMMENT_PREFIX="agent-snapshot"
+      _kr_load_writer_conf
+      ;;
+    replica)
+      STABLE_LINK="$HOME/.ssh/id_ed25519_agentsnapshot_replica"
+      COMMENT_PREFIX="agent-snapshot-replica"
+      _kr_load_replica_conf
+      ;;
+    *)
+      echo "snapshot-key-rotate: unknown role '$r' (use writer or replica)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+_kr_apply_ak_enabled() {
+  if [ "$APPLY_AK" = "1" ]; then
+    return 0
+  fi
+  if [ "$APPLY_AK" = "0" ]; then
+    return 1
+  fi
+  [ "$CONF_APPLY_AK" -eq 1 ]
+}
+
+_kr_comment() {
+  printf '%s:%s\n' "$COMMENT_PREFIX" "$1"
+}
+
+_kr_key_priv() {
+  printf '%s/%s\n' "$KEYS_DIR" "$1"
+}
+
+_kr_key_pub() {
+  printf '%s/%s.pub\n' "$KEYS_DIR" "$1"
+}
+
+_kr_now_epoch() {
+  date +%s
+}
+
+_kr_iso_from_epoch() {
+  date -r "$1" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date -r "$1"
+}
+
+_kr_read_state_field() {
+  local field=$1 default=${2-}
+  /usr/bin/python3 - "$STATE_FILE" "$field" "$default" <<'PY'
+import json, sys
+path, field, default = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (IOError, OSError, ValueError):
+    print(default)
+    sys.exit(0)
+val = data.get(field)
+if val is None:
+    print(default)
+else:
+    print(val)
+PY
+}
+
+_kr_state_exists() {
+  [ -f "$STATE_FILE" ]
+}
+
+_kr_write_state_json() {
+  local payload=$1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would write state.json"
+    return 0
+  fi
+  printf '%s\n' "$payload" | asnap_write_atomic "$STATE_FILE"
+}
+
+_kr_build_initial_state() {
+  local active_id=$1 bootstrap_legacy=${2:-false}
+  /usr/bin/python3 - "$active_id" "$ROLE" "$ROTATION_DAYS" "$OVERLAP_HOURS" \
+    "$COMMENT_PREFIX" "$FORCED_CMD" "$bootstrap_legacy" <<'PY'
+import json, sys, datetime
+active, role, days, hours, prefix, forced, boot = sys.argv[1:8]
+now = datetime.datetime.now().astimezone()
+payload = {
+    "schema": 1,
+    "role": role,
+    "active": active,
+    "previous": None,
+    "overlap_until": None,
+    "rotation_interval_days": int(days),
+    "overlap_hours": int(hours),
+    "authorized_keys_comment_prefix": prefix,
+    "forced_command": forced,
+    "last_rotate_at": None,
+    "last_finalize_at": None,
+    "bootstrap_from_legacy": boot == "true",
+}
+print(json.dumps(payload, indent=1, sort_keys=True))
+PY
+}
+
+_kr_update_state_rotate() {
+  local new_active=$1 prev=$2 overlap_until_iso=$3
+  /usr/bin/python3 - "$STATE_FILE" "$new_active" "$prev" "$overlap_until_iso" <<'PY'
+import json, sys, datetime
+path, new_active, prev, overlap_until = sys.argv[1:5]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (IOError, OSError, ValueError):
+    raise SystemExit("state.json missing or corrupt")
+now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+data["active"] = new_active
+data["previous"] = prev
+data["overlap_until"] = overlap_until
+data["last_rotate_at"] = now
+print(json.dumps(data, indent=1, sort_keys=True))
+PY
+}
+
+_kr_update_state_finalize() {
+  /usr/bin/python3 - "$STATE_FILE" <<'PY'
+import json, sys, datetime
+path = sys.argv[1]
+with open(path) as fh:
+    data = json.load(fh)
+now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+data["previous"] = None
+data["overlap_until"] = None
+data["last_finalize_at"] = now
+print(json.dumps(data, indent=1, sort_keys=True))
+PY
+}
+
+_kr_backup_file() {
+  local src=$1
+  local bak
+  bak="${src}.kr-backup-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$src" "$bak"
+  printf '%s\n' "$bak"
+}
+
+_kr_symlink_target() {
+  if [ -L "$STABLE_LINK" ]; then
+    readlink "$STABLE_LINK" || true
+  elif [ -f "$STABLE_LINK" ]; then
+    printf '%s\n' "$STABLE_LINK"
+  fi
+}
+
+_kr_resolve_key_path() {
+  local target
+  target="$(_kr_symlink_target)"
+  if [ -z "$target" ]; then
+    return 1
+  fi
+  case "$target" in
+    /*) printf '%s\n' "$target" ;;
+    *) printf '%s/%s\n' "$(dirname "$STABLE_LINK")" "$target" ;;
+  esac
+}
+
+_kr_flip_symlink() {
+  local key_id=$1
+  local target="$KEYS_DIR/$key_id"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would flip symlink $STABLE_LINK -> $target"
+    return 0
+  fi
+  ln -sfn "$target" "$STABLE_LINK"
+}
+
+_kr_acquire_rotation_lock() {
+  if [ "$_kr_rotation_lock_held" -eq 1 ]; then
+    return 0
+  fi
+  # Registry (and lock parent) must exist before mkdir lockdir — otherwise
+  # asnap_lock_acquire spins forever treating a failed mkdir as a stale lock.
+  mkdir -p "$REGISTRY"
+  chmod 0700 "$REGISTRY" 2>/dev/null || true
+  if ! asnap_lock_acquire "$ROT_LOCK" 120; then
+    echo "snapshot-key-rotate: another rotation is in progress (lock $ROT_LOCK); retry later" >&2
+    exit 1
+  fi
+  _kr_rotation_lock_held=1
+}
+
+_kr_release_rotation_lock() {
+  if [ "$_kr_rotation_lock_held" -eq 1 ]; then
+    asnap_lock_release "$ROT_LOCK"
+    _kr_rotation_lock_held=0
+  fi
+}
+
+_kr_with_rotation_lock() {
+  _kr_acquire_rotation_lock
+  trap '_kr_release_rotation_lock' EXIT INT TERM
+  "$@"
+  local rc=$?
+  _kr_release_rotation_lock
+  trap - EXIT INT TERM
+  return "$rc"
+}
+
+_kr_is_busy() {
+  [ -n "$BUSY_LOCK" ] || return 1
+  if [ "$FORCE" -eq 1 ]; then
+    return 1
+  fi
+  _asnap_is_busy "$BUSY_LOCK"
+}
+
+_kr_symlink_key_id() {
+  local target resolved
+  target="$(_kr_symlink_target)"
+  [ -n "$target" ] || return 1
+  basename "$target"
+}
+
+_kr_split_brain_active() {
+  local state_active link_id
+  state_active="$(_kr_read_state_field active "")"
+  [ -n "$state_active" ] || return 1
+  link_id="$(_kr_symlink_key_id 2>/dev/null || true)"
+  [ -n "$link_id" ] && [ "$link_id" != "$state_active" ]
+}
+
+_kr_report_split_brain() {
+  local state_active link_id
+  state_active="$(_kr_read_state_field active "")"
+  link_id="$(_kr_symlink_key_id 2>/dev/null || echo '?')"
+  echo "snapshot-key-rotate: SPLIT-BRAIN — state.json active=$state_active but stable symlink points at $link_id; refusing to proceed (manual recovery required)" >&2
+  _kr_log "SPLIT-BRAIN: state active=$state_active symlink=$link_id"
+}
+
+_kr_require_symlink_matches_active() {
+  local active link_id
+  active="$(_kr_read_state_field active "")"
+  link_id="$(_kr_symlink_key_id 2>/dev/null || true)"
+  if [ -z "$link_id" ] || [ "$link_id" != "$active" ]; then
+    _kr_report_split_brain
+    return 1
+  fi
+  return 0
+}
+
+_kr_pubkey_from_file() {
+  local pub_file=$1
+  /usr/bin/python3 - "$pub_file" <<'PY'
+import sys
+try:
+    with open(sys.argv[1]) as fh:
+        parts = fh.read().strip().split()
+except (IOError, OSError):
+    sys.exit(1)
+if len(parts) < 2:
+    sys.exit(1)
+print("%s %s" % (parts[0], parts[1]))
+PY
+}
+
+_kr_legacy_bare_comment_count() {
+  local ak_file=$1 bare_comment=$2
+  /usr/bin/python3 - "$ak_file" "$bare_comment" <<'PY'
+import sys
+path, bare = sys.argv[1], sys.argv[2]
+try:
+    lines = open(path).read().splitlines()
+except IOError:
+    print(0)
+    sys.exit(0)
+count = 0
+for line in lines:
+    parts = line.strip().split()
+    if parts and not line.lstrip().startswith("#") and parts[-1] == bare:
+        count += 1
+print(count)
+PY
+}
+
+_kr_legacy_bare_pubkey() {
+  local ak_file=$1 bare_comment=$2
+  /usr/bin/python3 - "$ak_file" "$bare_comment" <<'PY'
+import sys
+path, bare = sys.argv[1], sys.argv[2]
+try:
+    lines = open(path).read().splitlines()
+except IOError:
+    sys.exit(1)
+matches = []
+for line in lines:
+    parts = line.strip().split()
+    if parts and not line.lstrip().startswith("#") and parts[-1] == bare:
+        if len(parts) >= 3:
+            matches.append("%s %s" % (parts[-3], parts[-2]))
+if len(matches) != 1:
+    sys.exit(1)
+print(matches[0])
+PY
+}
+
+_kr_expected_ak_command_value() {
+  # Must match asnap_ak_line() command= payload (single-quoted path, spaces OK).
+  printf "/bin/bash '%s'" "$FORCED_CMD"
+}
+
+_kr_legacy_bare_command() {
+  local ak_file=$1 bare_comment=$2
+  /usr/bin/python3 - "$ak_file" "$bare_comment" <<'PY'
+import sys
+
+def extract_command(options):
+    marker = 'command="'
+    idx = options.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    i = start
+    while i < len(options):
+        ch = options[i]
+        if ch == "\\" and i + 1 < len(options):
+            i += 2
+            continue
+        if ch == '"':
+            return options[start:i]
+        i += 1
+    return None
+
+path, bare = sys.argv[1], sys.argv[2]
+try:
+    lines = open(path).read().splitlines()
+except IOError:
+    sys.exit(1)
+matches = []
+for line in lines:
+    stripped = line.strip()
+    parts = stripped.split()
+    if not parts or line.lstrip().startswith("#") or parts[-1] != bare:
+        continue
+    if len(parts) < 3:
+        sys.exit(1)
+    keytype, keydata, comment = parts[-3], parts[-2], parts[-1]
+    suffix = "%s %s %s" % (keytype, keydata, comment)
+    idx = line.rfind(suffix)
+    if idx == -1:
+        sys.exit(1)
+    options = line[:idx].rstrip()
+    cmd = extract_command(options)
+    if cmd is None:
+        sys.exit(1)
+    matches.append(cmd)
+if len(matches) != 1:
+    sys.exit(1)
+print(matches[0])
+PY
+}
+
+_kr_try_remove_legacy_ak_line() {
+  local key_id=$1 structured legacy_count legacy_pub expected_pub
+  structured="$(_kr_comment "$key_id")"
+
+  if ! asnap_ak_has "$AK_FILE" "$structured"; then
+    return 0
+  fi
+  if ! asnap_ak_has "$AK_FILE" "$COMMENT_PREFIX"; then
+    return 0
+  fi
+
+  legacy_count="$(_kr_legacy_bare_comment_count "$AK_FILE" "$COMMENT_PREFIX")"
+  if [ "${legacy_count:-0}" -eq 0 ]; then
+    return 0
+  fi
+  if [ "${legacy_count:-0}" -gt 1 ]; then
+    echo "snapshot-key-rotate: refuse legacy authorized_keys cleanup — multiple lines with bare comment '$COMMENT_PREFIX'" >&2
+    echo "Remove duplicate legacy lines manually, keeping only structured comments ($COMMENT_PREFIX:<key-id>)." >&2
+    return 1
+  fi
+
+  expected_pub="$(_kr_pubkey_from_file "$(_kr_key_pub "$key_id")")" || {
+    echo "snapshot-key-rotate: refuse legacy cleanup — cannot read public key for $key_id" >&2
+    return 1
+  }
+  legacy_pub="$(_kr_legacy_bare_pubkey "$AK_FILE" "$COMMENT_PREFIX")" || {
+    echo "snapshot-key-rotate: refuse legacy cleanup — ambiguous bare comment line '$COMMENT_PREFIX'" >&2
+    return 1
+  }
+  if [ "$legacy_pub" != "$expected_pub" ]; then
+    echo "snapshot-key-rotate: skip legacy cleanup — bare comment '$COMMENT_PREFIX' pubkey does not match $structured" >&2
+    echo "If the bare line is obsolete, remove it manually after verifying which key it represents." >&2
+    return 0
+  fi
+
+  expected_cmd="$(_kr_expected_ak_command_value)"
+  legacy_cmd="$(_kr_legacy_bare_command "$AK_FILE" "$COMMENT_PREFIX")" || {
+    echo "snapshot-key-rotate: refuse legacy authorized_keys cleanup — cannot parse command= on bare comment line '$COMMENT_PREFIX'" >&2
+    return 1
+  }
+  if [ "$legacy_cmd" != "$expected_cmd" ]; then
+    echo "snapshot-key-rotate: refuse legacy authorized_keys cleanup — bare comment '$COMMENT_PREFIX' pubkey matches $structured but forced command differs" >&2
+    echo "Found command= on bare line:" >&2
+    printf '  %s\n' "$legacy_cmd" >&2
+    echo "Expected command= for this $ROLE role:" >&2
+    printf '  %s\n' "$expected_cmd" >&2
+    echo "Another job may own this line (same key material, different forced command)." >&2
+    echo "Do not delete it automatically. Remove manually only after confirming it is obsolete for that other job." >&2
+    return 1
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would remove legacy bare AK line ($COMMENT_PREFIX) matching $structured"
+    return 0
+  fi
+  if ! _kr_apply_ak_enabled; then
+    echo "NOTE: legacy bare comment '$COMMENT_PREFIX' duplicates structured line $structured — remove manually:" >&2
+    return 0
+  fi
+  if ! asnap_ak_remove "$AK_FILE" "$COMMENT_PREFIX"; then
+    _kr_log "legacy cleanup: failed to remove bare comment line ($COMMENT_PREFIX)"
+    return 1
+  fi
+  _kr_log "legacy cleanup: removed bare comment line ($COMMENT_PREFIX) matching $structured"
+  return 0
+}
+
+_kr_overlap_remaining_sec() {
+  local overlap_until
+  overlap_until="$(_kr_read_state_field overlap_until "")"
+  [ -n "$overlap_until" ] || { echo 0; return 0; }
+  /usr/bin/python3 - "$overlap_until" <<'PY'
+import sys, datetime
+raw = sys.argv[1]
+try:
+    dt = datetime.datetime.fromisoformat(raw)
+except ValueError:
+    print(0)
+    sys.exit(0)
+if dt.tzinfo is None:
+    dt = dt.astimezone()
+now = datetime.datetime.now(dt.tzinfo)
+print(max(0, int((dt - now).total_seconds())))
+PY
+}
+
+_kr_overlap_expired() {
+  local rem
+  rem="$(_kr_overlap_remaining_sec)"
+  [ "${rem:-0}" -le 0 ]
+}
+
+_kr_key_age_days() {
+  local key_id mtime now
+  key_id="$(_kr_read_state_field active "")"
+  [ -n "$key_id" ] || { echo "?"; return 0; }
+  mtime="$(asnap_mtime "$(_kr_key_priv "$key_id")")"
+  [ -n "$mtime" ] || { echo "?"; return 0; }
+  now="$(_kr_now_epoch)"
+  /usr/bin/python3 - "$mtime" "$now" <<'PY'
+import sys
+start, now = int(sys.argv[1]), int(sys.argv[2])
+print(max(0, (now - start) // 86400))
+PY
+}
+
+_kr_next_rotate_due_epoch() {
+  local key_id mtime
+  key_id="$(_kr_read_state_field active "")"
+  mtime="$(asnap_mtime "$(_kr_key_priv "$key_id")")"
+  [ -n "$mtime" ] || return 1
+  echo $(( mtime + ROTATION_DAYS * 86400 ))
+}
+
+_kr_run_auth_probe() {
+  local rc
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would auth-probe ssh -i $STABLE_LINK localhost probe-auth"
+    return 0
+  fi
+  set +e
+  ssh -i "$STABLE_LINK" -o IdentitiesOnly=yes -o BatchMode=yes localhost probe-auth
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+_kr_run_probe() {
+  local mode rc
+  case "$ROLE" in
+    writer) mode=probe ;;
+    replica) mode=mirror ;;
+  esac
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would probe ssh -i $STABLE_LINK localhost $mode"
+    return 0
+  fi
+  set +e
+  ssh -i "$STABLE_LINK" -o IdentitiesOnly=yes -o BatchMode=yes localhost "$mode"
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+_kr_secure_rm() {
+  local f=$1
+  [ -e "$f" ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would securely delete $f"
+    return 0
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred -u "$f" 2>/dev/null || rm -f "$f"
+  else
+    rm -P "$f" 2>/dev/null || rm -f "$f"
+  fi
+}
+
+_kr_cmd_status() {
+  local active prev overlap_until age_days rem_sec due_epoch
+  local ak_active_ok=unknown symlink_ok=unknown pending=""
+
+  if ! _kr_state_exists; then
+    echo "Role: $ROLE"
+    echo "Registry: not bootstrapped"
+    if [ -e "$STABLE_LINK" ]; then
+      echo "Legacy key: $STABLE_LINK (run bootstrap to migrate)"
+    else
+      echo "Legacy key: missing — run snapshot-install first"
+    fi
+    return 0
+  fi
+
+  active="$(_kr_read_state_field active "")"
+  prev="$(_kr_read_state_field previous "")"
+  overlap_until="$(_kr_read_state_field overlap_until "")"
+  age_days="$(_kr_key_age_days)"
+
+  if [ -L "$STABLE_LINK" ] && [ -f "$(_kr_resolve_key_path)" ]; then
+    symlink_ok=yes
+  elif [ -f "$STABLE_LINK" ]; then
+    symlink_ok="flat-file (not symlink)"
+  else
+    symlink_ok=broken
+  fi
+
+  if [ -n "$active" ]; then
+    if asnap_ak_has "$AK_FILE" "$(_kr_comment "$active")"; then
+      ak_active_ok=yes
+    else
+      ak_active_ok=no
+      pending="${pending}active authorized_keys line missing for $(_kr_comment "$active"); "
+    fi
+  fi
+
+  if _kr_split_brain_active; then
+    pending="${pending}SPLIT-BRAIN: state active=$active but symlink=$(_kr_symlink_key_id 2>/dev/null || echo '?'); rotate/finalize blocked; "
+  fi
+
+  if [ -n "$prev" ]; then
+    rem_sec="$(_kr_overlap_remaining_sec)"
+    if [ "$rem_sec" -gt 0 ]; then
+      pending="${pending}overlap in progress (${rem_sec}s remaining); finalize after expiry; "
+    elif _kr_overlap_expired; then
+      if _kr_split_brain_active; then
+        pending="${pending}overlap expired but finalize blocked by SPLIT-BRAIN; "
+      else
+        pending="${pending}overlap expired — finalize due; "
+      fi
+    fi
+    if ! asnap_ak_has "$AK_FILE" "$(_kr_comment "$prev")"; then
+      pending="${pending}previous AK line already absent ($(_kr_comment "$prev")); "
+    fi
+  fi
+
+  if ! _kr_apply_ak_enabled; then
+    pending="${pending}print-only mode — append AK lines manually before symlink flip; "
+  fi
+
+  due_epoch="$(_kr_next_rotate_due_epoch 2>/dev/null || true)"
+  echo "Role: $ROLE"
+  echo "Registry: $REGISTRY"
+  echo "Active key: ${active:-?} (age ${age_days} days; interval ${ROTATION_DAYS} days)"
+  echo "Previous key: ${prev:-none}"
+  echo "Overlap until: ${overlap_until:-none}"
+  echo "Stable symlink: $STABLE_LINK -> $(_kr_symlink_target || echo '?')"
+  echo "Symlink resolves: $symlink_ok"
+  echo "Active AK line present: $ak_active_ok"
+  echo "Apply authorized_keys: $(_kr_apply_ak_enabled && echo yes || echo no)"
+  if [ -n "$due_epoch" ]; then
+    echo "Next rotation due: $(_kr_iso_from_epoch "$due_epoch") (epoch $due_epoch)"
+  fi
+  if [ -n "$pending" ]; then
+    echo "Pending actions: $pending"
+  else
+    echo "Pending actions: none"
+  fi
+}
+
+_kr_cmd_bootstrap() {
+  local legacy legacy_pub key_id ak_comment ak_line needs_comment_update=0
+
+  if _kr_state_exists; then
+    _kr_log "bootstrap: already bootstrapped ($STATE_FILE)"
+    _kr_cmd_status
+    return 0
+  fi
+
+  if [ ! -e "$STABLE_LINK" ]; then
+    echo "snapshot-key-rotate: no legacy key at $STABLE_LINK — run snapshot-install first" >&2
+    exit 1
+  fi
+
+  key_id="key-legacy-$(date +%Y%m%d-%H%M%S)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would bootstrap legacy key -> $key_id"
+    return 0
+  fi
+
+  mkdir -p "$KEYS_DIR"
+  chmod 0700 "$REGISTRY" "$KEYS_DIR" 2>/dev/null || true
+
+  if [ -L "$STABLE_LINK" ]; then
+    legacy="$(_kr_resolve_key_path)"
+    legacy_pub="${legacy}.pub"
+  else
+    legacy="$STABLE_LINK"
+    legacy_pub="${STABLE_LINK}.pub"
+  fi
+
+  if [ ! -f "$legacy" ]; then
+    echo "snapshot-key-rotate: legacy private key missing: $legacy" >&2
+    exit 1
+  fi
+
+  mv "$legacy" "$(_kr_key_priv "$key_id")"
+  if [ -f "$legacy_pub" ]; then
+    mv "$legacy_pub" "$(_kr_key_pub "$key_id")"
+  fi
+  chmod 0600 "$(_kr_key_priv "$key_id")" "$(_kr_key_pub "$key_id")" 2>/dev/null || true
+
+  _kr_write_state_json "$(_kr_build_initial_state "$key_id" true)"
+  _kr_flip_symlink "$key_id"
+  _kr_log "bootstrap: migrated legacy key to $key_id"
+
+  ak_comment="$(_kr_comment "$key_id")"
+  if asnap_ak_has "$AK_FILE" "$ak_comment"; then
+    echo "authorized_keys already has structured comment $ak_comment"
+    if ! _kr_try_remove_legacy_ak_line "$key_id"; then
+      exit 1
+    fi
+  else
+    needs_comment_update=1
+    echo "NOTE: authorized_keys may still use a legacy comment (e.g. '$COMMENT_PREFIX' without key id)."
+    echo "      The next rotate will append a line with comment $ak_comment."
+    echo "      Or append manually:"
+    ak_line="$(asnap_ak_line "$FORCED_CMD" "$(_kr_key_pub "$key_id")" "$ak_comment")" || true
+    [ -n "$ak_line" ] && printf '%s\n' "$ak_line"
+  fi
+
+  _kr_cmd_status
+  return 0
+}
+
+_kr_cmd_probe() {
+  if ! _kr_state_exists && [ ! -e "$STABLE_LINK" ]; then
+    echo "snapshot-key-rotate: nothing to probe — bootstrap first" >&2
+    exit 1
+  fi
+  _kr_log "probe: starting ($ROLE)"
+  if _kr_run_probe; then
+    _kr_log "probe: OK"
+    exit 0
+  fi
+  _kr_log "probe: FAILED"
+  exit 1
+}
+
+# Post-rollback local verification — deterministic checks that do not require ssh.
+# Returns 0 only when the previous configuration is intact on disk.
+_kr_rollback_verify_local_state() {
+  local expected_active=$1
+  local ok=1 active_comment link_id priv_path state_active
+
+  active_comment="$(_kr_comment "$expected_active")"
+  if asnap_ak_has "$AK_FILE" "$active_comment"; then
+    _kr_log "ROLLBACK VERIFY CHECK: active authorized_keys line present ($active_comment)"
+  else
+    _kr_log "ROLLBACK VERIFY FAILED: active authorized_keys line missing ($active_comment)"
+    ok=0
+  fi
+
+  link_id="$(_kr_symlink_key_id 2>/dev/null || true)"
+  if [ "$link_id" = "$expected_active" ]; then
+    _kr_log "ROLLBACK VERIFY CHECK: stable symlink resolves to active key ($expected_active)"
+  else
+    _kr_log "ROLLBACK VERIFY FAILED: stable symlink points at ${link_id:-?} expected $expected_active"
+    ok=0
+  fi
+
+  priv_path="$(_kr_key_priv "$expected_active")"
+  if [ -f "$priv_path" ]; then
+    _kr_log "ROLLBACK VERIFY CHECK: active private key file exists ($priv_path)"
+  else
+    _kr_log "ROLLBACK VERIFY FAILED: active private key missing ($priv_path)"
+    ok=0
+  fi
+
+  if ! _kr_state_exists; then
+    _kr_log "ROLLBACK VERIFY FAILED: state.json missing"
+    ok=0
+  else
+    state_active="$(_kr_read_state_field active "")"
+    if [ -n "$state_active" ] && [ "$state_active" = "$expected_active" ]; then
+      _kr_log "ROLLBACK VERIFY CHECK: state.json active=$state_active (coherent)"
+    elif [ -z "$state_active" ]; then
+      _kr_log "ROLLBACK VERIFY FAILED: state.json missing active key"
+      ok=0
+    else
+      _kr_log "ROLLBACK VERIFY FAILED: state.json active=$state_active expected $expected_active"
+      ok=0
+    fi
+  fi
+
+  [ "$ok" -eq 1 ]
+}
+
+_kr_rollback_rotate() {
+  local old_symlink_target=$1 old_state_backup=$2 new_comment=$3 old_active=$4
+  local rollback_action_fail=0 verify_outcome
+  _kr_log "ROLLBACK: auth probe failed — restoring previous configuration"
+  if [ -n "$old_symlink_target" ]; then
+    if [ "$DRY_RUN" -eq 0 ]; then
+      ln -sfn "$old_symlink_target" "$STABLE_LINK"
+    fi
+    _kr_log "ROLLBACK: restored symlink -> $old_symlink_target"
+  fi
+  if _kr_apply_ak_enabled && [ -n "$new_comment" ]; then
+    if asnap_ak_remove "$AK_FILE" "$new_comment"; then
+      _kr_log "ROLLBACK: removed appended AK line ($new_comment)"
+    else
+      _kr_log "ROLLBACK: WARNING failed to remove AK line ($new_comment) — manual cleanup required"
+      rollback_action_fail=1
+    fi
+  fi
+  if [ -n "${old_state_backup:-}" ] && [ -f "$old_state_backup" ]; then
+    if [ "$DRY_RUN" -eq 0 ]; then
+      cp -p "$old_state_backup" "$STATE_FILE"
+    fi
+    _kr_log "ROLLBACK: restored state.json from backup"
+  fi
+
+  if ! _kr_rollback_verify_local_state "$old_active"; then
+    rollback_action_fail=1
+  fi
+
+  if [ "$rollback_action_fail" -eq 1 ]; then
+    echo "snapshot-key-rotate: CATASTROPHIC — rollback did not restore a working configuration; manual intervention required (see $ROTLOG)" >&2
+    exit 1
+  fi
+
+  if _kr_run_auth_probe; then
+    _kr_log "ROLLBACK VERIFY OK: local configuration restored (auth probe confirmed)"
+    verify_outcome=verified
+  else
+    _kr_log "ROLLBACK VERIFY INCONCLUSIVE: local configuration restored; auth probe unavailable"
+    verify_outcome=inconclusive
+  fi
+
+  if [ "$verify_outcome" = "inconclusive" ]; then
+    echo "snapshot-key-rotate: ROTATION FAILED — auth probe failed; rolled back to previous key, but post-rollback verification inconclusive (auth probe unavailable)" >&2
+    echo "Local configuration checks passed: active authorized_keys line present; stable symlink resolves to active private key; private key file exists; state.json coherent." >&2
+    echo "Confirm end-to-end access manually: snapshot-key-rotate --role $ROLE status && ssh -i $STABLE_LINK -o IdentitiesOnly=yes -o BatchMode=yes localhost probe-auth" >&2
+    exit 1
+  fi
+
+  echo "snapshot-key-rotate: ROTATION FAILED — auth probe failed; rolled back to previous key" >&2
+  exit 1
+}
+
+_kr_do_rotate() {
+  local active old_active new_id new_comment ak_line overlap_iso
+  local old_symlink_target new_priv
+
+  if ! _kr_state_exists; then
+    echo "snapshot-key-rotate: not bootstrapped — run bootstrap first" >&2
+    exit 1
+  fi
+
+  if _kr_split_brain_active; then
+    _kr_report_split_brain
+    exit 1
+  fi
+
+  if _kr_is_busy "$BUSY_LOCK"; then
+    _kr_log "rotate: deferred — busy lock held ($BUSY_LOCK)"
+    echo "snapshot-key-rotate: snapshot/engine run in progress (lock $BUSY_LOCK); retry later" >&2
+    exit 79
+  fi
+
+  active="$(_kr_read_state_field active "")"
+  [ -n "$active" ] || { echo "snapshot-key-rotate: state.json missing active key" >&2; exit 1; }
+
+  new_id="key-$(date +%Y%m%d-%H%M%S)"
+  while [ -e "$(_kr_key_priv "$new_id")" ]; do
+    sleep 1
+    new_id="key-$(date +%Y%m%d-%H%M%S)"
+  done
+  new_comment="$(_kr_comment "$new_id")"
+  old_active="$active"
+  old_symlink_target="$(_kr_symlink_target)"
+
+  overlap_iso="$(/usr/bin/python3 - "$OVERLAP_HOURS" <<'PY'
+import sys, datetime
+hours = int(sys.argv[1])
+print((datetime.datetime.now().astimezone() + datetime.timedelta(hours=hours)).isoformat(timespec="seconds"))
+PY
+)"
+
+  _kr_log "rotate: generating $new_id (previous active=$old_active)"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$KEYS_DIR"
+    new_priv="$(_kr_key_priv "$new_id")"
+    ssh-keygen -t ed25519 -N "" -C "$new_comment" -f "$new_priv" >/dev/null
+    chmod 0600 "$new_priv" "$(_kr_key_pub "$new_id")"
+  fi
+
+  ak_line="$(asnap_ak_line "$FORCED_CMD" "$(_kr_key_pub "$new_id")" "$new_comment")" || {
+    echo "snapshot-key-rotate: failed to build authorized_keys line" >&2
+    exit 1
+  }
+
+  if _kr_apply_ak_enabled; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      _kr_log "DRY-RUN: would append AK line for $new_comment"
+    else
+      if ! asnap_ak_append "$AK_FILE" "$ak_line"; then
+        _kr_log "rotate: FAILED to append authorized_keys line"
+        exit 1
+      fi
+      if ! asnap_ak_has "$AK_FILE" "$new_comment"; then
+        _kr_log "rotate: FAILED — new AK line not confirmed present after append"
+        exit 1
+      fi
+      _kr_log "rotate: appended and verified AK line ($new_comment)"
+    fi
+  else
+    echo "APPEND this line to $AK_FILE:"
+    printf '%s\n' "$ak_line"
+    if ! asnap_ak_has "$AK_FILE" "$new_comment"; then
+      _kr_log "rotate: pending — AK line not present; symlink will NOT flip"
+      echo "snapshot-key-rotate: re-run with --apply-authorized-keys after appending the line" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    _kr_log "DRY-RUN: would flip symlink to $new_id, auth-probe, then commit state.json"
+  fi
+
+  _kr_flip_symlink "$new_id"
+  _kr_log "rotate: flipped symlink to $new_id (AK verified before flip)"
+
+  if ! _kr_run_auth_probe; then
+    _kr_rollback_rotate "$old_symlink_target" "" "$new_comment" "$old_active"
+  fi
+
+  # Cutover succeeded (symlink flipped, auth verified). Commit state before legacy
+  # AK hygiene — a cosmetic cleanup failure must not leave split-brain (N1).
+  if [ "$DRY_RUN" -eq 0 ]; then
+    _kr_write_state_json "$(_kr_update_state_rotate "$new_id" "$old_active" "$overlap_iso")"
+  fi
+
+  if ! _kr_try_remove_legacy_ak_line "$old_active"; then
+    echo "snapshot-key-rotate: WARNING — rotation cutover succeeded (auth verified, state committed) but legacy authorized_keys cleanup failed." >&2
+    echo "Automated rotation will continue on schedule; this is not a rotation failure (exit $KR_EXIT_LEGACY_CLEANUP)." >&2
+    echo "Manual action required:" >&2
+    echo "  1. Review the cleanup refusal/error messages above." >&2
+    echo "  2. Edit $AK_FILE — remove the obsolete bare comment line ($COMMENT_PREFIX) only when safe." >&2
+    echo "  3. Re-run: snapshot-key-rotate --role $ROLE status" >&2
+    _kr_log "rotate: PARTIAL OK — state committed; legacy AK cleanup needs manual action (exit $KR_EXIT_LEGACY_CLEANUP)"
+    exit "$KR_EXIT_LEGACY_CLEANUP"
+  fi
+
+  _kr_log "rotate: OK — active=$new_id previous=$old_active overlap_until=$overlap_iso"
+  echo "Rotation complete. Active: $new_id  Previous: $old_active"
+  echo "Finalize after overlap ($OVERLAP_HOURS h) removes $(_kr_comment "$old_active")"
+}
+
+_kr_cmd_rotate() {
+  _kr_with_rotation_lock _kr_do_rotate
+}
+
+_kr_do_finalize() {
+  local prev prev_comment active active_comment
+
+  if ! _kr_state_exists; then
+    echo "snapshot-key-rotate: not bootstrapped" >&2
+    exit 1
+  fi
+
+  if _kr_split_brain_active; then
+    _kr_report_split_brain
+    exit 1
+  fi
+
+  prev="$(_kr_read_state_field previous "")"
+  if [ -z "$prev" ] || [ "$prev" = "None" ]; then
+    _kr_log "finalize: nothing to finalize"
+    echo "Nothing to finalize (no previous key)."
+    return 0
+  fi
+
+  if ! _kr_overlap_expired && [ "$FORCE" -eq 0 ]; then
+    _kr_log "finalize: refused — overlap window not expired (use --force to override)"
+    echo "snapshot-key-rotate: overlap window still active; refusing finalize without --force" >&2
+    exit 1
+  fi
+
+  active="$(_kr_read_state_field active "")"
+  active_comment="$(_kr_comment "$active")"
+  prev_comment="$(_kr_comment "$prev")"
+
+  if [ ! -f "$(_kr_key_priv "$active")" ]; then
+    echo "snapshot-key-rotate: CATASTROPHIC — active private key missing ($(_kr_key_priv "$active"))" >&2
+    _kr_log "CATASTROPHIC: active private key missing before finalize ($active)"
+    exit 1
+  fi
+
+  if ! _kr_require_symlink_matches_active; then
+    exit 1
+  fi
+
+  if ! asnap_ak_has "$AK_FILE" "$active_comment"; then
+    echo "snapshot-key-rotate: CATASTROPHIC — active key AK line missing ($active_comment) before finalize" >&2
+    _kr_log "CATASTROPHIC: active AK line missing before finalize ($active_comment)"
+    exit 1
+  fi
+
+  _kr_log "finalize: removing previous key $prev ($prev_comment)"
+
+  if _kr_apply_ak_enabled; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      _kr_log "DRY-RUN: would remove AK line $prev_comment"
+    else
+      if ! asnap_ak_remove "$AK_FILE" "$prev_comment"; then
+        _kr_log "finalize: failed to remove previous AK line ($prev_comment)"
+        exit 1
+      fi
+    fi
+  else
+    echo "REMOVE this authorized_keys line (exact comment $prev_comment):"
+    echo "(manual mode — not editing authorized_keys)"
+  fi
+
+  if ! asnap_ak_has "$AK_FILE" "$active_comment"; then
+    echo "snapshot-key-rotate: CATASTROPHIC — active key AK line missing AFTER removal ($active_comment)" >&2
+    _kr_log "CATASTROPHIC: active AK line missing after removal ($active_comment)"
+    exit 1
+  fi
+
+  _kr_secure_rm "$(_kr_key_priv "$prev")"
+  _kr_secure_rm "$(_kr_key_pub "$prev")"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    _kr_write_state_json "$(_kr_update_state_finalize)"
+  fi
+  _kr_log "finalize: OK — previous key $prev removed; active $active unchanged"
+  echo "Finalize complete. Active key: $active"
+}
+
+_kr_cmd_finalize() {
+  _kr_with_rotation_lock _kr_do_finalize
+}
+
+_kr_do_rotate_if_due() {
+  local age_days prev
+
+  if ! _kr_state_exists; then
+    _kr_log "rotate-if-due: not bootstrapped — running bootstrap only"
+    _kr_cmd_bootstrap
+    _kr_log "rotate-if-due: bootstrap complete — stopping (no rotation on first run)"
+    return 0
+  fi
+
+  if _kr_split_brain_active; then
+    _kr_report_split_brain
+    exit 1
+  fi
+
+  age_days="$(_kr_key_age_days)"
+  if [ "$age_days" != "?" ] && [ "$age_days" -ge "$ROTATION_DAYS" ]; then
+    _kr_log "rotate-if-due: key age ${age_days}d >= ${ROTATION_DAYS}d — rotating"
+    _kr_do_rotate
+    return $?
+  fi
+
+  prev="$(_kr_read_state_field previous "")"
+  if [ -n "$prev" ] && [ "$prev" != "None" ]; then
+    if _kr_overlap_expired; then
+      if _kr_split_brain_active; then
+        _kr_report_split_brain
+        exit 1
+      fi
+      _kr_log "rotate-if-due: overlap expired — auth-probing active key before finalize"
+      if _kr_run_auth_probe; then
+        _kr_do_finalize
+        return $?
+      fi
+      _kr_log "rotate-if-due: active key auth probe failed — deferring finalize"
+      exit 1
+    fi
+  fi
+
+  _kr_log "rotate-if-due: no action due (key age ${age_days}d)"
+  _kr_cmd_status
+  return 0
+}
+
+_kr_cmd_rotate_if_due() {
+  _kr_with_rotation_lock _kr_do_rotate_if_due
+}
+
+# ---------- argument parsing ----------
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    status|bootstrap|probe|rotate|finalize|rotate-if-due)
+      SUBCMD="$1"
+      shift
+      ;;
+    --role)
+      ROLE="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --apply-authorized-keys)
+      APPLY_AK=1
+      shift
+      ;;
+    --no-apply-authorized-keys)
+      APPLY_AK=0
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    -h|--help)
+      _kr_usage
+      exit 0
+      ;;
+    *)
+      echo "snapshot-key-rotate: unknown argument: $1" >&2
+      _kr_usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[ -n "$SUBCMD" ] || { _kr_usage >&2; exit 2; }
+
+if [ -z "$ROLE" ]; then
+  ROLE="$(_kr_detect_role 2>/dev/null || true)"
+fi
+if [ -z "$ROLE" ]; then
+  echo "snapshot-key-rotate: cannot detect role — pass --role writer|replica" >&2
+  exit 2
+fi
+
+_kr_init_role "$ROLE"
+
+case "$SUBCMD" in
+  status) _kr_cmd_status ;;
+  bootstrap) _kr_cmd_bootstrap ;;
+  probe) _kr_cmd_probe ;;
+  rotate) _kr_cmd_rotate ;;
+  finalize) _kr_cmd_finalize ;;
+  rotate-if-due) _kr_cmd_rotate_if_due ;;
+esac

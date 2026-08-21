@@ -29,7 +29,7 @@ permanently destroy history:**
 |---|---|
 | Rogue agent deletes your production files | Files vanish from *future* snapshots only. Every existing dated snapshot still contains them, on separate hardware, for the full retention window (default 90 days). |
 | Agent/script deletes or corrupts files silently | The daily snapshot diff makes it visible; history preserves the last good copy. |
-| Compromised source machine attacks the backups | The backup SSH key is **forced-command locked** (`restrict` + a closed allowlist: `snap`, `vault`, `both`, `probe`). It cannot run a delete, cannot open a shell, cannot choose what executes. Pruning runs only on the archive host, under its own policy. |
+| Compromised source machine attacks the backups | The backup SSH key is **forced-command locked** (`restrict` + a closed allowlist: `snap`, `vault`, `both`, `probe`). It cannot run a delete, cannot open a shell, cannot choose what executes. Repeated triggers while the DAS sits at the free-space floor can still force early primary-side pruning — **rate limiting bounds that to at most 2 admitted runs per hour**; keys **rotate on a schedule** so a leaked key does not stay valid forever. Archive-side pruning runs under its own policy. |
 | Backup drive dies | The archive host replicates the primary DAS to a second mirror drive; a deep-verify proves the copies match. |
 | Corrupt archive shipped | Vault archives are integrity-tested **before** transfer and checksum-compared **after** landing. A truncated or corrupt archive is never counted as a backup. |
 | Backup silently stops running | Unreachable targets are failures, never skipped-as-success. Every run writes a summary log, and the monitor shows snapshot age and sync state at a glance. |
@@ -119,6 +119,13 @@ Everything lives in `conf/snapshot.conf` — no site details in code:
 | `SNAP_RETENTION` / `VAULT_RETENTION` | days of history kept per leg |
 | `SNAP_MIN_FREE_GB` | free-space floor on the DAS before abort/prune |
 | `EXCLUDES` | build output & OS noise excluded from every run |
+| `SNAP_RATE_*` | caps on how often `snap\|vault\|both` can be triggered through the forced-command dispatcher |
+| `KEY_ROTATION_*` | schedule and overlap for automatic writer dispatch-key rotation |
+
+Writer and replica forced-command keys **rotate automatically** on a schedule
+(default 90 days, with overlap) when the rotation launchd job is installed —
+see [`docs/KEY-ROTATION.md`](docs/KEY-ROTATION.md). Limits and trust boundaries
+in depth: [`docs/SAFETY.md`](docs/SAFETY.md).
 
 ## Requirements
 
@@ -133,5 +140,6 @@ Everything lives in `conf/snapshot.conf` — no site details in code:
 
 - [AGENT-SETUP.md](AGENT-SETUP.md) — the agent-followable install runbook
 - [docs/SAFETY.md](docs/SAFETY.md) — the data-protection model in depth
+- [docs/KEY-ROTATION.md](docs/KEY-ROTATION.md) — dispatch-key rotation runbook
 - [docs/DESIGN.md](docs/DESIGN.md) — why ssh-to-localhost, verification philosophy
 - MIT licensed.

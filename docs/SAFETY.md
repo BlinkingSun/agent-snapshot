@@ -33,14 +33,50 @@ four words: `snap`, `vault`, `both`, `probe`. Anything else — a shell, an
 So even an agent (or malware) that fully controls the source machine and
 steals the backup key can only... trigger a backup, or a read-only probe.
 
+**Credential lifetime.** The writer dispatch key rotates on a schedule (default:
+every 90 days, with a 72-hour overlap window where the previous key still
+authenticates). This **bounds how long a leaked key stays usable** — after
+finalize removes the old `authorized_keys` line, that private key is dead. It
+does **not** prevent use during the overlap window: a key captured while active
+remains valid until finalize. It is **not a substitute** for the forced-command
+containment above, which is what actually prevents deletion; rotation limits
+*validity*, not *capability*. Operator details:
+[`docs/KEY-ROTATION.md`](KEY-ROTATION.md).
+
+**Trigger rate limiting (source).** The forced-command key still cannot delete
+history directly — but a holder can repeatedly trigger `snap` or `both`, and
+when free space on the primary DAS sits below `SNAP_MIN_FREE_GB`, each
+**completed** run can force `prune_snap_to_fit()` to drop **one** oldest
+snapshot. That is an indirect retention bypass, not a delete command.
+`snapshot-dispatch` admits at most **3 triggers in 10 minutes** and **2 in 60
+minutes** for `snap|vault|both` (`probe` is exempt — read-only, no prune path).
+Rate limiting **bounds** that abuse path; it does **not** eliminate it. While
+the disk stays pinned at the floor, worst-case forced deletion is **one snapshot
+per admitted trigger**, and admitted triggers are capped at **2 per hour** on
+the sustain window — not impossible, but far slower than unbounded repetition.
+
 **Hardening note (two-machine setups):** the snapshot rsync itself travels
-over your normal ssh identity to the archive host. If you want the same
-guarantee on that hop, give it a dedicated key too and restrict it on the
-archive host with a forced command that only permits rsync into the snapshot
-directory (e.g. `rrsync -wo <PRIMARY>/agent-snapshot`) — then no credential on
-the source machine can delete archive data at all. Recommended for
-agent-heavy machines; single-machine mode already has this property for the
-scheduled path.
+over your normal ssh identity (`SNAP_SSH`) to the archive host. That credential
+is **unrestricted** on the archive side today — it can reach a shell and can
+also bypass archive-side trigger rate limits (see below). If you want the same
+guarantee on that hop, give it a dedicated key and restrict it on the archive
+host with a forced command that only permits rsync into the snapshot directory
+(e.g. `rrsync -wo <PRIMARY>/agent-snapshot`) — then no credential on the
+source machine can delete archive data at all. Recommended for agent-heavy
+machines; single-machine mode already has this property for the scheduled
+forced-command path.
+
+On the archive host, the replica forced-command key (`mirror|deep-verify` only)
+is separately rate-limited (defaults: 4 `mirror` triggers per 5 minutes, 2
+`deep-verify` per 24 hours). The post-snapshot **kick** (`REPLICA_KICK`) runs
+over the normal `SNAP_SSH` identity with `AGENT_SNAPSHOT_KICK=1`; `mirror.sh`
+exempts that path so legitimate kicks are not counted against the replica
+forced-command key's limits. **Archive rate limits protect the replica
+forced-command key — not the kick path.** Anyone who already holds `SNAP_SSH`
+could set `AGENT_SNAPSHOT_KICK=1` themselves and bypass those limits too; that
+is a **pre-existing property of the unrestricted rsync hop**, not a new hole
+this pass introduces — the recommended follow-on is the restricted `rrsync` key
+above.
 
 ## 3. Deleting on the primary drive does not wipe the mirror
 
@@ -107,12 +143,35 @@ trustworthy):
 - Every run appends a summary to the monthly log; `finished (rc=0)` is the
   only success marker.
 - Free-space floors abort the run before they'd wedge a drive.
+- **Dispatcher denials:** exit **78** means rate-limited (the trigger never
+  started); **79** means a run is already active (busy — not counted against the
+  rate limit). On the source, denials land in `dispatch.log` and
+  `~/Library/Application Support/agent-snapshot/state/last-rate-limit.json`. On
+  the archive host, the same artifact lives under `~/Library/AgentSnapshot/`
+  and the monitor raises health rule **P16** on the next pass when a
+  forced-command trigger was denied.
 
 ## 6. What this does NOT protect against — be honest with yourself
 
 - **Compromise of the archive host itself.** Anyone with a shell on the
   archive host can destroy both drives. Keep it remote, minimal, and boring;
   don't run agents on it.
+- **Local shell on the source machine.** Rate limits live in the forced-command
+  dispatchers; anyone with an interactive account can run `bin/snapshot`
+  directly and bypass them. Full host compromise is out of scope — same as the
+  rest of this model.
+- **A leaked key during the overlap window.** Rotation bounds exposure time; it
+  does not instantly revoke a key someone already copied. Both old and new keys
+  work until finalize.
+- **Snapshot-spam at disk floor, bounded not blocked.** A holder of only the
+  writer forced-command key can still force early primary-side pruning while
+  free space stays below `SNAP_MIN_FREE_GB` — at most about **two**
+  retention-bypassing deletions per hour under the default sustain cap, not
+  zero. Rate limiting is a bound on worst-case loss, not a guarantee that spam
+  cannot accelerate it at all.
+- **Holders of `SNAP_SSH`.** They can bypass archive-side rate limits (including
+  via `AGENT_SNAPSHOT_KICK=1`) at the same trust level as the unrestricted
+  rsync hop in §2 — not a new bypass introduced by rate limiting.
 - **Physical loss of the site** (fire, theft, surge taking both DAS drives).
   The optional vault leg on separate hardware helps; true off-site is on you.
 - **Data that never made it into a snapshot** — files created and destroyed

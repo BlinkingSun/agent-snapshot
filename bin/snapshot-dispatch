@@ -23,10 +23,12 @@
 #   read-only probe — never a delete, never an arbitrary command.
 #
 # MODES
-#   snap   -> snapshot snap    (hardlink snapshot to the archive host DAS)
-#   vault  -> snapshot vault   (compressed archive to the vault host)
-#   both   -> snapshot both
-#   probe  -> READ-ONLY self-test of source access. Backs nothing up. Safe anytime.
+#   snap       -> snapshot snap    (hardlink snapshot to the archive host DAS)
+#   vault      -> snapshot vault   (compressed archive to the vault host)
+#   both       -> snapshot both
+#   probe      -> READ-ONLY operational health check (source, rsync, archive/vault).
+#   probe-auth -> READ-ONLY auth gate only: sshd accepted this key and ran this script.
+#                 No conf, no external deps — for key rotation cutover verification.
 #
 set -uo pipefail
 
@@ -42,13 +44,108 @@ LOGDIR="$HOME/Library/Logs/agent-snapshot"
 mkdir -p "$LOGDIR"
 DLOG="$LOGDIR/dispatch.log"
 
+DISPATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KEY_LIB="$DISPATCH_DIR/snapshot-key-lib.sh"
+if [ ! -r "$KEY_LIB" ]; then
+  echo "snapshot-dispatch: missing rate-limit library $KEY_LIB" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$KEY_LIB"
+
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$DLOG"; }
+
+_emit_rate_deny() {
+  local mode=$1 deny_json=$2
+  local reason burst_count sustain_count retry_after_ts retry_when limit_desc
+  local deny_fields
+  deny_fields=$(/usr/bin/python3 - "$deny_json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except (IOError, OSError, ValueError):
+    sys.exit(1)
+print("\t".join([
+    str(d.get("reason", "unknown")),
+    str(d.get("burst_count", "?")),
+    str(d.get("sustain_count", "?")),
+    str(d.get("retry_after_ts", 0)),
+]))
+PY
+) || {
+    log "DENIED mode=$mode reason=unknown (could not read $deny_json)"
+    echo "snapshot-dispatch: rate limit denied for mode '$mode' (details unavailable)" >&2
+    return
+  }
+  IFS=$'\t' read -r reason burst_count sustain_count retry_after_ts <<< "$deny_fields"
+  retry_when=$(date -r "$retry_after_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "epoch $retry_after_ts")
+  case "$reason" in
+    burst)
+      limit_desc="${SNAP_RATE_BURST_COUNT} per ${SNAP_RATE_BURST_WINDOW_SEC}s burst window"
+      ;;
+    sustain)
+      limit_desc="${SNAP_RATE_SUSTAIN_COUNT} per ${SNAP_RATE_SUSTAIN_WINDOW_SEC}s sustain window"
+      ;;
+    *)
+      limit_desc="$reason"
+      ;;
+  esac
+  log "DENIED mode=$mode reason=$reason burst_count=$burst_count sustain_count=$sustain_count client=[${SSH_CLIENT:-none}] retry_after=$retry_when"
+  echo "snapshot-dispatch: rate limit denied for mode '$mode': $reason limit ($limit_desc) reached (burst_count=$burst_count sustain_count=$sustain_count); retry after $retry_when" >&2
+}
 
 MODE="${SSH_ORIGINAL_COMMAND:-}"
 log "request mode=[$MODE] client=[${SSH_CLIENT:-none}] pid=$$"
 
 case "$MODE" in
   snap|vault|both)
+    # snap|vault|both need STAGE (busy lock) and rate thresholds from conf — probe
+    # sources conf separately with its own error text; do not share that path.
+    # shellcheck disable=SC1090
+    source "$CONF" 2>/dev/null || {
+      log "FAIL cannot read $CONF"
+      echo "snapshot-dispatch: cannot read config $CONF" >&2
+      exit 1
+    }
+    if [ -z "${STAGE:-}" ]; then
+      log "FAIL STAGE unset after sourcing $CONF"
+      echo "snapshot-dispatch: STAGE unset in $CONF" >&2
+      exit 1
+    fi
+    # Brief defaults (IMPLEMENTATION-BRIEF.md) — never run unlimited on missing thresholds.
+    SNAP_RATE_BURST_COUNT=${SNAP_RATE_BURST_COUNT:-3}
+    SNAP_RATE_BURST_WINDOW_SEC=${SNAP_RATE_BURST_WINDOW_SEC:-600}
+    SNAP_RATE_SUSTAIN_COUNT=${SNAP_RATE_SUSTAIN_COUNT:-2}
+    SNAP_RATE_SUSTAIN_WINDOW_SEC=${SNAP_RATE_SUSTAIN_WINDOW_SEC:-3600}
+
+    STATE_DIR="$(asnap_state_dir)"
+    HISTORY="$STATE_DIR/trigger-history.json"
+    HISTORY_LOCK="$STATE_DIR/trigger-history.lockdir"
+    DENY_JSON="$STATE_DIR/last-rate-limit.json"
+    BUSY_LOCK="$STAGE/.lock"
+
+    asnap_admit "$HISTORY" "$HISTORY_LOCK" "$BUSY_LOCK" "source-forced" "$MODE" \
+      "${SSH_CLIENT:-}" \
+      "$SNAP_RATE_BURST_COUNT" "$SNAP_RATE_BURST_WINDOW_SEC" \
+      "$SNAP_RATE_SUSTAIN_COUNT" "$SNAP_RATE_SUSTAIN_WINDOW_SEC" \
+      "$DENY_JSON"
+    admit_rc=$?
+    if [ "$admit_rc" -eq 79 ]; then
+      log "BUSY mode=$MODE client=[${SSH_CLIENT:-none}] lock=$BUSY_LOCK"
+      echo "snapshot-dispatch: snapshot already running (lock $BUSY_LOCK); try again later" >&2
+      exit 79
+    fi
+    if [ "$admit_rc" -eq 78 ]; then
+      _emit_rate_deny "$MODE" "$DENY_JSON"
+      exit 78
+    fi
+    if [ "$admit_rc" -ne 0 ]; then
+      log "FAIL asnap_admit rc=$admit_rc mode=$MODE"
+      echo "snapshot-dispatch: rate-limit admission failed (rc=$admit_rc)" >&2
+      exit 1
+    fi
+
     log "-> exec snapshot $MODE"
     exec /bin/bash "$BIN" "$MODE"
     ;;
@@ -104,6 +201,12 @@ case "$MODE" in
     log "probe finished rc=$rc_all"
     echo "probe: OVERALL rc=$rc_all"
     exit $rc_all
+    ;;
+  probe-auth)
+    # Auth-only cutover gate: proves forced-command dispatch, nothing else.
+    echo "probe-auth: OK role=writer host=$(hostname -s)"
+    log "probe-auth OK role=writer host=$(hostname -s)"
+    exit 0
     ;;
   *)
     log "REFUSED unknown mode [$MODE]"

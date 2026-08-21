@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-snapshot.key-rotate</string>
+
+  <!-- Weekly key-rotation check: bounds exposure if a forced-command dispatch key
+       leaks (disk image, backup, compromised tool). rotate-if-due is a no-op when
+       the active key is younger than KEY_ROTATION_DAYS (default 90); otherwise it
+       rotates with overlap, or finalizes the previous key once overlap expires.
+       Unlike the snap/vault launchd legs, this job does NOT ssh to localhost — it
+       runs snapshot-key-rotate directly as the install user. Rotation only touches
+       ~/.ssh (registry, symlink, authorized_keys); that path is not TCC-protected,
+       so the sshd Full-Disk-Access forced-command hop is unnecessary here. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__APPDIR__/bin/snapshot-key-rotate</string>
+    <string>rotate-if-due</string>
+    <string>--role</string>
+    <string>writer</string>
+  </array>
+
+  <!-- Sunday 05:45 local: weekly maintenance window. Reference deployments run
+       snapshots as often as 4×/day including 00:15 and 04:00 — Sunday 04:00 (the
+       plan draft) collides with the 04:00 slot; 05:45 sits ~105 min later so a
+       long snap run can finish and release STAGE/.lock before rotation starts. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>5</integer>
+    <key>Minute</key>
+    <integer>45</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/agent-snapshot/launchd-key-rotate.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/agent-snapshot/launchd-key-rotate.log</string>
+</dict>
+</plist>

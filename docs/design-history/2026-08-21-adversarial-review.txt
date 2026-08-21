@@ -1,0 +1,279 @@
+# Adversarial Security Review: Combined Rotation (A) + Rate-Limit (B) Plans
+
+Independent verification against the live repo (`bin/snapshot`, `bin/snapshot-dispatch`, `bin/snapshot-install`, `archive-host/mirror.sh`, `archive-host/engine.py`, `conf/snapshot.conf.example`, launchd template). Line citations below are from the repo, not from either document.
+
+---
+
+## Executive summary
+
+Both documents describe real problems and mostly correct chokepoints. **Document B’s abuse path via `prune_snap_to_fit()` is verified.** **Document A’s overlap rotation model is sound and does not, by itself, break Document B’s shared-lane design.** The combined plan is implementable tomorrow, but several gaps are understated or missing — especially **residual deletion rate at disk floor**, **kick exemption trust model**, **dispatch/conf path coupling**, and **install/ordering merge risk**.
+
+**Verdict: GO-WITH-CHANGES** (not NOT-READY; not unconditional GO).
+
+---
+
+## 1. Interaction bug: two valid keys + one shared rate lane
+
+### What I checked
+- Document A: 72h overlap with two `authorized_keys` lines, same `command=`, different comments.
+- Document B §4.3 / §7.3: single lane `source-forced`; no per-key bucketing; `SSH_CLIENT` logged only.
+- `bin/snapshot-dispatch`: one entrypoint for all forced-command auth.
+
+### What I found: **confirmed-safe (for quota doubling)**
+
+During overlap, old and new keys are indistinguishable at the dispatcher. Both hit `snapshot-dispatch` → same `trigger-history.json` lane. An attacker holding **both** keys cannot get 2× quota by alternating keys: trigger 1 (old key) + trigger 2 (new key) still share one counter.
+
+Concrete worst case with defaults: still **≤3 counted triggers / 10 min** and **≤5 / hour**, regardless of which of two valid keys is used.
+
+### Recommendation
+- **Document explicitly** in the synthesis: “overlap adds valid authenticators, not rate-limit lanes.”
+- If Document A’s optional caller-scoped keys (§5.11) ship later, **Document B must gain per-key lanes** (`SSH_USER_AUTH` / comment fingerprint) or overlap + multi-slot **will** double quota. Flag as a hard coupling.
+
+---
+
+## 2. `prune_vault()` semantics (Document B implicit claim)
+
+### What I checked
+`prune_vault()` in `bin/snapshot`:
+
+```253:265:bin/snapshot
+prune_vault() {
+  local removed
+  if [ "$VAULT_OS" = "windows" ]; then
+    removed=$(ssh $SSH_OPTS "$VAULT_SSH" "powershell ... LastWriteTime -lt \$c ...")
+  else
+    removed=$(ssh $SSH_OPTS "$VAULT_SSH" "find '$VAULT_DIR' -maxdepth 1 -name '*.tar.zst' -mtime +$VAULT_RETENTION -print -delete" ...)
+  fi
+```
+
+Also `prune_snap()` (age from directory name, not trigger count):
+
+```156:166:bin/snapshot
+    for d in $(ls -1 | grep -E '^[0-9]{4}-...' | sort); do
+      day=${d%%_*}
+      age=$(( ... ))
+      if [ "$age" -gt $SNAP_RETENTION ]; then rm -rf "$d"; ...
+```
+
+### What I found: **confirmed-safe for spam-amplified deletion**
+
+- **`prune_vault` is age-based** (`find -mtime +N` / PowerShell `LastWriteTime`), **not count-based**. Document B does not claim otherwise for vault; good.
+- Repeated `vault` triggers in a short window **cannot delete more than one run’s eligible set**: already-deleted files are gone; re-running is idempotent.
+- **`bin/snapshot` single-instance lock** (`STAGE/.lock` + `.pid`) prevents concurrent runs, so no concurrent prune races on the writer side.
+- Residual edge cases (remote clock jump, manual mtime tampering on vault host) require **host compromise or SNAP_SSH access**, outside the forced-key-only threat model.
+
+### Recommendation
+- Document B should **not** imply vault spam causes retention bypass like `prune_snap_to_fit`. Vault spam is a **storage-fill / DoS** problem; rate-limiting vault modes is still right, but for different reasons.
+- No change required to vault prune logic for this combined plan.
+
+---
+
+## 3. `prune_snap_to_fit()` and threshold math
+
+### What I checked
+
+```174:182:bin/snapshot
+prune_snap_to_fit() {
+  ...
+  if [ "$count" -gt 1 ]; then rm -rf "$(echo "$list" | head -1)"; fi"
+}
+```
+
+And the call site only when `freegb < SNAP_MIN_FREE_GB` before rsync (lines 98–107). Document B’s “exactly one oldest snapshot per invocation” claim is **correct**.
+
+Also verified: `both` counts as **one** dispatch but runs `backup_snap` once → at most **one** `prune_snap_to_fit` per counted trigger.
+
+### Threshold binding (Document B math)
+
+Deny rules (allow 3 / 10 min, 5 / hour) mean:
+- Burst binds short windows (4th in 10 min denied).
+- **Sustain binds long abuse: max 5 counted triggers in any rolling 60 minutes.**
+
+Document B §7.4 says “~3 per 10 min” as worst case; that understates the **hour-long** bound. The tighter long-run cap is **5 deletions/hour** *if* disk stays pinned below floor and each run completes.
+
+### My judgment: **real gap — too permissive for the stated prime directive**
+
+With disk chronically at floor, an attacker with the forced key can delete **up to 5 oldest snapshots per hour, every hour** (120/day in theory). For a ~90-snapshot / 90-day retention deployment, that can erase **the entire primary history in less than a day** — not “unbounded,” but still catastrophic relative to SAFETY.md’s “history is immutable” story.
+
+Document B acknowledges residual slow abuse; I think the **default sustain count (5/hour) is too high** for the verified deletion path, not “balanced.”
+
+### Recommendation
+- **Before implementation:** lower default `SNAP_RATE_SUSTAIN_COUNT` to **2** (or 3 max), *or* add a third “floor-aware” lane (requires reading free space before counting — more invasive).
+- Synthesis doc must state honestly: **rate limit reduces abuse; it does not cap retention loss to an acceptable number when disk is pinned at floor.**
+- Consider **separate tighter limits for `snap` vs `vault`** (vault doesn’t hit `prune_snap_to_fit`, but currently shares the same bucket).
+
+---
+
+## 4. Busy-lock exemption (exit 79, no quota consumed)
+
+### What I checked
+Document B order: busy probe on `STAGE/.lock` **before** rate-limit slot consumption. Current snapshot lock:
+
+```39:49:bin/snapshot
+LOCK="$STAGE/.lock"
+exec 9>"$LOCK"
+if ! flock -n 9 2>/dev/null; then
+  if [ -f "$STAGE/.pid" ] && kill -0 "$(cat "$STAGE/.pid")" ...
+    exit 0
+fi
+echo $$ > "$STAGE/.pid"
+```
+
+### What I found: **confirmed-safe for deletion amplification; minor quota-preservation nuance**
+
+- Attacker **cannot** keep a request “pending” through a multi-minute run: each SSH session runs dispatch synchronously → immediate 79 or admission.
+- Busy attempts **do not consume quota**, which **preserves** burst budget for post-run counted triggers. That slightly favors an attacker vs counting busy attempts, but **does not exceed** 3/10min or 5/hour caps on admissions.
+- Busy exemption **does not bypass** rate limits for completed runs (the only path to `prune_snap_to_fit`).
+
+**Separate TOCTOU issue (not in either doc):** two near-simultaneous dispatches can both pass “not busy” before either `exec snapshot` acquires `.lock`, consume **two rate slots**, but only one snapshot runs (second exits 0 inside `bin/snapshot`). That wastes quota / can DoS the legitimate user, but doesn’t increase deletions.
+
+### Recommendation
+- Busy exemption: **keep it**; document tradeoff.
+- Fix TOCTOU: acquire rate-limit slot **and** re-check busy under the same flock, or use “busy OR rate-limit” as one atomic decision before `exec`.
+
+---
+
+## 5. Writer-kick exemption (`AGENT_SNAPSHOT_KICK=1`)
+
+### What I checked
+Current kick path:
+
+```146:151:bin/snapshot
+  if [ -n "${REPLICA_KICK:-}" ]; then
+    if ssh $SSH_OPTS "$SNAP_SSH" "$REPLICA_KICK"; then
+```
+
+Install template today (`bin/snapshot-install` line 97, `conf/snapshot.conf.example` line 55):
+
+```bash
+REPLICA_KICK='nohup "$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'
+```
+
+Document B proposes adding `AGENT_SNAPSHOT_KICK=1` to that string; `mirror.sh` would skip limits when set.
+
+### What I found: **real gap for SNAP_SSH holders; acceptable for forced-key-only model**
+
+- **Replica forced-command key alone:** cannot set env on kick path; cannot forge kick without authenticating via normal `SNAP_SSH` shell. **Not bypassable by the Document B threat model alone.**
+- **Anyone with `SNAP_SSH` (normal SSH to archive host):** can run  
+  `AGENT_SNAPSHOT_KICK=1 ~/Library/AgentSnapshot/mirror.sh mirror`  
+  unlimited times and **fully bypass archive rate limits**. Document B defers this to “source-side rate limit’s job,” but **source rate limit does not limit direct archive SSH** — only forced-command triggers on the source.
+- This is **pre-existing architecture** (SAFETY.md §2 hardening note: unrestricted rsync hop). Document B’s env var **does not make it worse for forced-key attackers**; it **codifies a trust boundary** that is weaker than it sounds.
+
+### Recommendation
+- Accept env-var exemption **only if** synthesis explicitly documents: “Archive rate limits protect the **replica forced-command key**; kicks are trusted like `SNAP_SSH`.”
+- Stronger design (future): HMAC/token in kick command minted by source using a secret not available to archive SSH shell, or restrict `SNAP_SSH` with forced `rrsync` (already recommended in SAFETY.md).
+- **Must ship atomically:** `mirror.sh` exemption + updated `REPLICA_KICK` in install template + example conf + upgrade note. Without `AGENT_SNAPSHOT_KICK=1`, post-snapshot kicks over `SNAP_SSH` hit `SSH_CONNECTION` detection and **count as forced mirror traffic** — likely OK at 1 kick/snap + 5-min poll, but fragile during testing bursts (Document B §10 #7).
+
+---
+
+## 6. Implementation ordering (both plans same day)
+
+### What I checked
+Touch overlap:
+| Area | Doc A | Doc B |
+|---|---|---|
+| `bin/snapshot-install` | bootstrap, symlink, key-rotate copy, AK format | `state/` dir, rate conf, `REPLICA_KICK` |
+| `bin/snapshot-dispatch` | optional logging | rate limit + busy check |
+| `archive-host/mirror.sh` | optional log | rate limit + kick exempt |
+| State paths | `~/.ssh/agent-snapshot/` | `APPDIR/state/`, `~/Library/AgentSnapshot/` |
+
+Stable symlink (`~/.ssh/id_ed25519_agent_snapshot` → registry key) **does not** affect Document B lock/history paths. Launchd plist path unchanged (template line 16). **No path conflict.**
+
+### What I found: **needs-a-decision on merge order, not a hard incompatibility**
+
+Recommended order:
+
+1. **Shared install scaffolding (single PR section):** `state/` dir (700), rate-limit conf vars, `REPLICA_KICK` with kick flag, copy any shared bash helpers.
+2. **Document B first (abuse path):** `snapshot-dispatch` rate limit + busy check; `mirror.sh` limits + kick exempt; `engine.py` P16; selftests for 78/79/78.
+3. **Document A second:** `snapshot-key-lib.sh`, `snapshot-key-rotate`, bootstrap, symlink layout, rotate/finalize, key-rotate launchd template, docs.
+4. **Docs last:** merged SAFETY / AGENT-SETUP / KEY-ROTATION runbook.
+
+**Critical pairing:** never deploy new `mirror.sh` without new `REPLICA_KICK` string (and vice versa for existing installs).
+
+**Hidden dependency Doc B under-specifies:** busy check needs `STAGE` from conf, but `snapshot-dispatch` today **does not source conf** for `snap|vault|both` (only `probe` does). Implementers must add conf sourcing or busy check reads the wrong lock.
+
+**Align rotation guard with dispatch:** Doc A rotate-if-due checks `STAGE/.pid`; Doc B busy checks `STAGE/.lock`. Prefer **`.lock` non-blocking probe** in both (tiny window where rotation could start mid-snapshot if only `.pid` is checked).
+
+---
+
+## 7. Additional skeptical findings
+
+### 7a. Document B correctly identifies the abuse path; Document A doesn’t mention it
+No conflict, but synthesis should cross-reference: rotation **does not** mitigate `prune_snap_to_fit` spam during overlap; rate limit does.
+
+### 7b. Document A factual claims — verified
+| Claim | Status |
+|---|---|
+| Key created once in `snapshot-install` (lines 100–106) | ✓ |
+| Flat key path `~/.ssh/id_ed25519_agent_snapshot` | ✓ |
+| Plist hardcodes key path | ✓ |
+| Forced dispatch allowlist | ✓ (`snapshot-dispatch`) |
+| Rotation checks `$STAGE/.pid` like snapshot | ✓ reference, but see lock note above |
+| Install never edits `authorized_keys` | ✓ |
+
+### 7c. Document B factual claims — verified
+| Claim | Status |
+|---|---|
+| `prune_snap_to_fit` deletes one oldest | ✓ |
+| Snapshot overlap lock exits 0 | ✓ (lines 45–46) |
+| `REPLICA_KICK` via `SNAP_SSH` | ✓ |
+| Archive poll 300s | ✓ (`archive-host/README.md`) |
+| Engine skip exit 2 | ✓ (`engine.py` ~2026) |
+| P16 doesn’t exist yet | ✓ (planned) |
+| Exit 77 for bad mode | ✓ |
+
+### 7d. Document B: exit 79 vs today’s silent exit 0
+Changing concurrent dispatch from “success (0) at snapshot layer” to **79 at dispatch** is correct for abuse detection but **changes launchd semantics** (failed job). Document it in upgrade notes.
+
+### 7e. Linux archive host
+`mirror.sh` forced-path detection via `SSH_CONNECTION` means **cron/manual invocations bypass archive rate limits entirely**. Document A already scopes Linux out of rotation; Document B should say the same for rate limits or extend design.
+
+### 7f. `probe` unlimited
+Verified: probe can run rsync dry-run + SSH checks with no rate limit. Lower risk than snap path; still a possible CPU/network nuisance. Document B’s exclusion is intentional — flag as known limitation.
+
+### 7g. Document A internal tension (print-only AK vs symlink flip)
+§5.6 pseudocode flips symlink before AK append; §5.9 recommends **don’t flip until AK grep succeeds**. Synthesis must pick **§5.9** or operators get lockout.
+
+### 7h. Auto-finalize during overlap
+If old key was stolen, **72h overlap = 72h of full capability** for that key, plus shared rate limit. Rotation reduces *indefinite* exposure, not overlap exposure. Document A is honest about this; synthesis should not oversell.
+
+---
+
+## Findings table (condensed)
+
+| # | Topic | Checked | Result | Recommendation |
+|---|---|---|---|---|
+| 1 | Two keys + shared lane | Dispatch + both docs | **Confirmed-safe** (no 2× quota) | Document invariant; block multi-key slots without per-key lanes |
+| 2 | `prune_vault` spam | `bin/snapshot` | **Confirmed-safe** (age-based, idempotent) | Don’t treat vault like snap deletion abuse |
+| 3 | `prune_snap_to_fit` + limits | `bin/snapshot` + math | **Real gap** (5/hour still catastrophic at floor) | Lower sustain default; document residual risk |
+| 4 | Busy exemption | Lock order + snapshot flow | **Confirmed-safe** for extra deletions | Keep; fix dispatch TOCTOU |
+| 5 | Kick env var | `REPLICA_KICK` + trust model | **Real gap** for `SNAP_SSH` holders only | Document trust boundary; ship kick string atomically |
+| 6 | Implementation order | File touch map | **Needs-a-decision** (merge, not block) | B before A; merged install; conf-source for STAGE |
+| 7 | Misc. | Full doc pass | Mixed | See §7 |
+
+---
+
+## Verdict: **GO-WITH-CHANGES**
+
+Implement tomorrow **only after** the synthesis incorporates the mandatory changes below.
+
+### Exact must-change list before implementation starts
+
+1. **State explicitly:** overlap rotation does **not** multiply rate-limit quota; one shared lane for all forced-command writer triggers.
+2. **Tighten source sustain default** from 5/hour to **≤2/hour** (or justify 5 in writing against “erase all history in <24h at floor”).
+3. **`snapshot-dispatch` must source `conf/snapshot.conf`** for `STAGE` (and rate thresholds) before busy check — do not hardcode cache path only.
+4. **Ship together:** `mirror.sh` rate gate + `AGENT_SNAPSHOT_KICK=1` in install template, example conf, and upgrade note for existing deployments.
+5. **Document trust boundary** for kick exemption: protects replica **forced key**, not `SNAP_SSH` compromise.
+6. **Merge `snapshot-install` changes** in one pass (`state/`, rate vars, key bootstrap/symlink, rotate script install).
+7. **Implementation order:** rate-limit (B) → rotation (A); never mirror.sh without REPLICA_KICK update.
+8. **Rotation busy guard:** use **`STAGE/.lock` non-blocking flock**, not `.pid` alone (align with B).
+9. **Fix dispatch TOCTOU:** rate-limit admission + busy re-check under same lock (or equivalent).
+10. **Document exit 79** behavior change for launchd/operator expectations.
+11. **Pick one symlink/AK gate** (recommended: no symlink flip until new AK line present).
+12. **Future-proof:** if caller-scoped keys ship, rate limits must bucket by key identity.
+
+Optional but strongly recommended: separate burst bucket for `deep-verify` is already in B; consider **separate or tighter bucket for `snap` vs `vault`**, and note Linux/cron bypass for archive limits.
+
+---
+
+**Bottom line:** The combined architecture is directionally right — correct chokepoints, verified deletion abuse path, rotation that won’t accidentally double rate-limit budget. The plan is **not ready to implement verbatim** because default sustain limits understate acceptable data loss at disk floor, kick exemption trust is underspecified, and dispatch/conf coupling is easy to get wrong in a same-day merge. Fix the twelve items above in the synthesis and proceed.

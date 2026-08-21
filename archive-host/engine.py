@@ -94,6 +94,7 @@ SUPPRESS_CAP_SECONDS = 21600  # 00 F5 P14 / F10: 6 h. A copy running longer than
 PENDING_MAX_SECONDS = 21600   # 00 F5 P15: 6 h. A settled stamp still uncopied after this means the
                               # replica is FALLING BEHIND, which is a problem and never just a note.
 DEEP_VERIFY_MAX_AGE_DAYS = 8  # 00 F5 P13
+RATE_LIMIT_MAX_AGE_SEC = 86400  # 00 F5 P16: mirror.sh denial artifact self-clears after 24 h
 ORPHAN_FAIL_HOURS = 48        # 00 F5 P11
 ORPHAN_WARN_HOURS = 24        # 00 F5 notes
 PRIMARY_STALE_DAYS = 2        # 00 F5 P3 (calendar days)
@@ -525,6 +526,7 @@ class Engine(object):
         self.staging_meta_path = os.path.join(self.state_dir, "staging.json")
         self.pending_path = os.path.join(self.state_dir, "pending.json")
         self.grandfathered_path = os.path.join(self.state_dir, "grandfathered.json")
+        self.rate_limit_path = os.path.join(self.state_dir, "last-rate-limit.json")
 
         if self.test_mode:
             self.legacy_lock = env.get("SNAP_LEGACY_LOCK") or \
@@ -862,6 +864,69 @@ class Engine(object):
         if age_days > DEEP_VERIFY_MAX_AGE_DAYS:
             self.problem("P13 last successful deep-verify was %.1f days ago (> %d): the content "
                          "safety net has stopped running" % (age_days, DEEP_VERIFY_MAX_AGE_DAYS))
+
+    def _read_rate_limit_artifact(self):
+        """Read mirror.sh's last-rate-limit.json.  Missing/empty/truncated/malformed -> None."""
+        try:
+            if not os.path.isfile(self.rate_limit_path):
+                return None
+            if os.path.getsize(self.rate_limit_path) == 0:
+                return None
+            with open(self.rate_limit_path, "r") as fh:
+                raw = fh.read()
+        except (IOError, OSError) as exc:
+            self.log("last-rate-limit.json unreadable: %s" % exc)
+            return None
+        if not raw.strip():
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            self.log("last-rate-limit.json unreadable: %s" % exc)
+            return None
+        if not isinstance(data, dict):
+            self.log("last-rate-limit.json unreadable: not an object")
+            return None
+        try:
+            ts = int(data["ts"])
+        except (KeyError, TypeError, ValueError):
+            self.log("last-rate-limit.json unreadable: missing or invalid ts")
+            return None
+        mode = data.get("mode")
+        reason = data.get("reason")
+        if mode not in ("mirror", "deep-verify") or reason not in ("burst", "sustain"):
+            self.log("last-rate-limit.json unreadable: missing or invalid mode/reason")
+            return None
+        iso = data.get("iso")
+        if not iso:
+            try:
+                iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
+            except (ValueError, OSError):
+                iso = str(ts)
+        return {"ts": ts, "iso": str(iso), "mode": mode, "reason": reason,
+                "count": data.get("count"), "limit": data.get("limit"),
+                "window_sec": data.get("window_sec"),
+                "client": data.get("client") or ""}
+
+    def check_rate_limit_denial(self):
+        """00 F5 P16.  mirror.sh writes last-rate-limit.json on exit 78; the engine surfaces it on
+        the next pass.  Denials older than 24 h self-clear; corrupt artifacts are ignored."""
+        denial = self._read_rate_limit_artifact()
+        if denial is None:
+            return
+        age = time.time() - denial["ts"]
+        if age < 0 or age > RATE_LIMIT_MAX_AGE_SEC:
+            return
+        self.problem("P16 forced-command trigger rate-limited (%s): %s at %s — "
+                     "possible abuse of the replica forced-command key"
+                     % (denial["mode"], denial["reason"], denial["iso"]))
+        if self.persist.get("last_rate_limit_event_ts") != denial["ts"]:
+            detail = ("mode=%s reason=%s count=%s limit=%s window_sec=%s client=%s"
+                      % (denial["mode"], denial["reason"], denial.get("count"),
+                         denial.get("limit"), denial.get("window_sec"), denial["client"]))
+            self.event("rate_limited", None, detail)
+            self.persist["last_rate_limit_event_ts"] = denial["ts"]
+            write_json(self.persist_path, self.persist)
 
     def check_clock_skew(self, prev_ts):
         """FG5, engine half.  The monitor clamps stale_seconds at 0 (F10); the engine can also SEE
@@ -1901,10 +1966,11 @@ class Engine(object):
             if mounted and st["free_kb"] < min_kb:
                 self.problem("P8 %s volume has only %.1f GB free (< %.0f GB)"
                              % (label, st["free_kb"] / 1048576.0, self.min_free_gb))
-        # P13 / P14 / P15
+        # P13 / P14 / P15 / P16
         self.check_deep_verify_age()
         self.check_stuck_copy()
         self.check_pending_age()
+        self.check_rate_limit_denial()
         # P9
         self.check_wipe_alarm()
         # P10

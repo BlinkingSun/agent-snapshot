@@ -166,7 +166,7 @@ def snap(root, prev, new, f2window=False, change=True):
 
 def partial(root, prev, new):
     """Mimics a backup run that created its stamp dir and then died mid-write: a TRUNCATED tree,
-    and `latest` is NOT repointed.  Verified 2026-08-19: mbp-backup does not clean this up."""
+    and `latest` is NOT repointed.  Verified 2026-08-19: bin/snapshot does not clean this up."""
     P = pdir(root)
     D = os.path.join(P, new)
     os.makedirs(os.path.join(D, "a"))
@@ -661,8 +661,12 @@ SSH_ORIGINAL_COMMAND="deep-verify" ENG
 aeq "deep-verify via SSH_ORIGINAL_COMMAND" "deep-verify" "$(Q 'd["pass_kind"]')"
 ENG garbage-mode
 aeq "unknown argv[1] maps to mirror" mirror "$(Q 'd["pass_kind"]')"
-aeq "mirror.sh line count < 15 (00 F3)" "yes" \
-    "$([ "$(wc -l < "$ENGDIR/mirror.sh" | tr -d ' ')" -lt 15 ] && echo yes || echo no)"
+# 00 F3 audibility: mirror.sh is the sshd forced-command target — an AK auditor must read the
+# whole entrypoint in one screen. Pre-hardening bound was <15 lines; P16 forced-path rate limits
+# added threshold selection and admit/deny dispatch (machinery lives in snapshot-key-lib.sh).
+# probe-auth (C3 auth-only cutover gate) adds an early exit before KEY_LIB/rate limits.
+aeq "mirror.sh line count <= 61 (00 F3 audibility)" "yes" \
+    "$([ "$(wc -l < "$ENGDIR/mirror.sh" | tr -d ' ')" -le 61 ] && echo yes || echo no)"
 anot "mirror.sh never execs the ssh command" "eval" "$(cat "$ENGDIR/mirror.sh")"
 
 ########################################################################################

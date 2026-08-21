@@ -1,0 +1,636 @@
+# agent-snapshot SSH Credential Rotation — Design Document
+
+**Status:** Planning only (no implementation)  
+**Audience:** Implementation team  
+**Scope:** The two forced-command SSH credentials in this architecture — source writer dispatch key and archive-host replica key — not the optional third hop (source → archive rsync over the user’s normal SSH identity).
+
+---
+
+## 1. Problem Statement
+
+### 1.1 What works today
+
+agent-snapshot uses **forced-command SSH** as both a macOS TCC workaround and a containment boundary:
+
+| Credential | Host | Private key (today) | Forced command | Allowlist |
+|---|---|---|---|---|
+| Writer dispatch | Source machine | `~/.ssh/id_ed25519_agent_snapshot` | `bin/snapshot-dispatch` | `snap\|vault\|both\|probe` |
+| Replica dispatch | Archive host (macOS) | `~/.ssh/id_ed25519_agentsnapshot_replica` | `archive-host/mirror.sh` | `mirror\|deep-verify` |
+
+Each `authorized_keys` line looks like:
+
+```
+restrict,command="/bin/bash '<path/to/dispatcher>'" ssh-ed25519 AAAA... agent-snapshot
+```
+
+Containment is solid: a stolen key cannot delete history, open a shell, or override the pinned command. That property must be preserved by any rotation design.
+
+### 1.2 The gap
+
+Both keys are:
+
+1. **Generated once** by install (`snapshot-install` step 3; archive README manual step).
+2. **Never rotated, never expired, never revoked automatically.**
+3. **Shared by all callers** — launchd, manual `ssh -i … localhost snap`, and any AI agent — with no distinction or audit trail per caller.
+4. **Valid until a human notices a leak** and manually edits `authorized_keys` and deletes the private key.
+
+For a public OSS product deployed by third parties, this creates unbounded blast radius: a key captured from a Time Machine backup, disk image, or compromised tool remains a permanent capability to trigger backups/probes (writer) or mirror/deep-verify (archive).
+
+### 1.3 Design constraints (non-negotiable)
+
+From the existing codebase and deployment model:
+
+- **Do not weaken containment.** Every authorized key must keep `restrict` + pinned `command=` + dispatcher allowlist.
+- **Preserve the “installer never edits `authorized_keys` by default” safety property** — bad edits can lock users out or break other forced-command jobs on the same machine.
+- **No mandatory `sshd_config` changes** for the default path (generic OSS users, macOS Remote Login, “never touch sshd” deployments).
+- **launchd must keep working unattended** (`BatchMode=yes`, no interactive prompts).
+- **Two-machine topology:** writer rotation is local to the source machine; replica rotation is local to the archive host. They are independent operations.
+- **Backward compatibility:** existing installs with a flat `~/.ssh/id_ed25519_agent_snapshot` must migrate cleanly.
+
+### 1.4 Credentials explicitly out of scope (document, don’t solve here)
+
+- **Source → archive rsync hop** uses the user’s normal SSH identity (`SNAP_SSH` in `conf/snapshot.conf`). `docs/SAFETY.md` already recommends a separate restricted `rrsync` key for agent-heavy machines. That is a separate hardening track; this design covers the two localhost forced-command keys only.
+
+---
+
+## 2. Architecture Recap (as implemented)
+
+```
+launchd (source)
+  └─ ssh -i ~/.ssh/id_ed25519_agent_snapshot localhost <mode>
+       └─ sshd forced command → snapshot-dispatch → snapshot → (optional) ssh to archive
+
+launchd (archive, macOS)
+  └─ ssh -i ~/.ssh/id_ed25519_agentsnapshot_replica localhost mirror|deep-verify
+       └─ sshd forced command → mirror.sh → engine.py
+```
+
+Relevant files today:
+
+| File | Role |
+|---|---|
+| `bin/snapshot-install` | Creates key if missing; prints one `authorized_keys` line; renders launchd plists |
+| `bin/snapshot-dispatch` | Writer allowlist dispatcher |
+| `archive-host/mirror.sh` | Archive allowlist dispatcher |
+| `launchd/com.agent-snapshot.leg.plist.template` | Hardcodes `__HOME__/.ssh/id_ed25519_agent_snapshot` |
+| `archive-host/README.md` | Documents replica key + plist inline (not templated in repo) |
+
+Key generation today (`bin/snapshot-install` lines 100–106):
+
+```bash
+if [ ! -f "$KEY" ]; then
+  ssh-keygen -t ed25519 -N "" -C "agent-snapshot" -f "$KEY" >/dev/null
+fi
+```
+
+---
+
+## 3. Options Considered
+
+### 3.1 Option A — Scheduled rotation with overlap window (recommended primary)
+
+**Mechanism:** Maintain a small key registry on each host. Periodically generate a new ed25519 keypair, **append** a second `authorized_keys` line (same `restrict,command=…`, new pubkey, structured comment), atomically point clients at the new private key, verify, then after a grace period **remove** the old line and delete the old private key.
+
+**Why it fits:** Uses the exact auth mechanism already deployed. No sshd changes. Overlap ensures scheduled jobs, in-flight snapshots, and manual invocations survive cutover.
+
+**Tradeoffs:**
+
+| Pros | Cons |
+|---|---|
+| Simple mental model for OSS users | `authorized_keys` still needs a human/agent append (or opt-in `--apply`) |
+| Proven pattern (dual-key overlap) | Overlap window = both keys work briefly (expected) |
+| Symlink indirection can avoid plist edits | Does not limit damage *during* overlap if old key was stolen |
+| Works identically on writer + replica | Rotation is periodic, not per-invocation |
+
+### 3.2 Option B — Ephemeral per-invocation credentials (token-push style)
+
+**Token-push pattern (reference):** a remote-job dispatcher pushes a one-shot per-job token file over a **separate, normal** SSH session; the remote shell reads it into the job's environment and **deletes the file before** the job starts. SSH authentication and job authorization are **two layers**.
+
+**Why it does not transfer directly to agent-snapshot forced-command SSH:**
+
+| Token-push dispatcher | agent-snapshot |
+|---|---|
+| SSH proves identity to reach a shell | SSH pubkey **is** the capability |
+| Job token consumed inside remote command | Auth completes **before** `snapshot-dispatch` / `mirror.sh` runs |
+| Token file is the secret | Private key file is the secret |
+| Stealing SSH key ≠ stealing the job token if it is ephemeral | Stealing SSH key = full capability until revoked |
+
+You **cannot** “delete the credential before the real command runs” inside the dispatcher — by then SSH has already accepted the key. A pre-invocation nonce file on disk adds no security against key theft (attacker with the key almost certainly has filesystem access to mint nonces).
+
+**SSH-native ephemeral variants evaluated:**
+
+| Sub-option | Verdict |
+|---|---|
+| **B1: One-time nonce file checked in dispatcher** | Security theater against key theft; adds race complexity |
+| **B2: Push ephemeral private key over SSH** | Never acceptable |
+| **B3: OpenSSH user certificates (CA-signed, short `-V` validity)** | **Valid advanced mode** — see §3.3 |
+| **B4: `AuthorizedKeysCommand` dynamic registry** | Valid but requires sshd config change; not default for OSS |
+
+**Conclusion:** The file-push token pattern solves a **second-factor inside the command** problem. agent-snapshot’s problem is **first-factor SSH pubkey persistence**. Ephemeral per-invocation requires SSH certificates or dynamic authorized-keys provisioning, not a literal port of the token-push pattern.
+
+### 3.3 Option C — OpenSSH CA with short-lived user certificates (recommended optional Phase 2)
+
+**Mechanism:**
+
+1. Install a **CA public key** in `authorized_keys` with `@cert-authority` prefix (one line, long-lived).
+2. Keep CA private key offline or in macOS Keychain with tight ACL.
+3. Before each invocation, mint a user certificate valid for e.g. **+10m**:
+   ```bash
+   ssh-keygen -s ca_key -I "snap-$(uuid)" -n "$USER" -V +10m user_key.pub
+   ```
+4. Client connects with `-i user_key -o CertificateFile=user_key-cert.pub`.
+
+**Containment preserved:** `@cert-authority,restrict,command="…"` still pins the dispatcher.
+
+**Tradeoffs:**
+
+| Pros | Cons |
+|---|---|
+| True time-bounded credentials | CA compromise = mint arbitrary valid certs until CA revoked |
+| Closest SSH-native analog to “ephemeral” | More complex ops; CA custody is critical |
+| Can combine with rotation (rotate CA, not every user key) | Still not strictly single-use without server-side serial tracking |
+| | Requires user education; easy to misconfigure |
+
+**Recommendation:** Ship as **`--auth-mode certificate` advanced profile**, not v1 default.
+
+### 3.4 Option D — Caller-scoped static keys (launchd vs manual vs agent)
+
+Three parallel keys in `authorized_keys`, same forced command, different comments (`agent-snapshot:scheduled`, `:manual`, `:agent`). Revoke one without killing others.
+
+**Verdict:** Good **additive** hardening alongside rotation (limits blast radius, aids forensics), but **does not solve expiry**. Not sufficient alone. Low cost to add comments/slots to Option A.
+
+### 3.5 Option E — Hardware-bound keys (`ed25519-sk` / Secure Enclave)
+
+Reduces exfiltration from disk backups if `-O no-touch-required` is **not** used — but launchd unattended jobs require `-O no-touch-required` or resident keys, which largely defeats the point.
+
+**Verdict:** Poor fit for scheduled backup automation. Mention in docs as “if you touch backups manually only.”
+
+---
+
+## 4. Recommendation
+
+### Primary (v1): **Option A — Scheduled overlap rotation with a key registry**
+
+Implement a unified **`bin/snapshot-key-rotate`** used on **both** the source machine (`--role writer`) and the archive host (`--role replica`). Default auth mode remains plain ed25519 pubkeys.
+
+### Secondary (v2, optional): **Option C — SSH CA short-lived certificates**
+
+For operators who want invocation-scoped validity, not just periodic rotation. Shares the same dispatcher/install plumbing; changes only how client credentials are minted and how the single `authorized_keys` line is formatted (`@cert-authority,…`).
+
+### Do not pursue as primary: **token-push ephemeral token files**
+
+Wrong layer of the stack for SSH pubkey forced-command auth.
+
+---
+
+## 5. Primary Design — Overlap Rotation (Detailed)
+
+### 5.1 New directory layout (both roles)
+
+```
+~/.ssh/agent-snapshot/
+  state.json                 # active key id, previous key id, overlap deadline, role
+  rotation.log               # append-only operator log
+  keys/
+    key-20260821-040001      # private (0600)
+    key-20260821-040001.pub
+    key-20260523-040001      # previous, retained during overlap only
+    key-20260523-040001.pub
+```
+
+**Compatibility symlink (critical — avoids plist churn):**
+
+| Role | Stable path (what plists/docs reference) | Symlink target |
+|---|---|---|
+| Writer | `~/.ssh/id_ed25519_agent_snapshot` | `~/.ssh/agent-snapshot/keys/<active-id>` |
+| Replica | `~/.ssh/id_ed25519_agentsnapshot_replica` | same pattern |
+
+launchd plists and docs **keep using the stable paths**. Rotation updates the symlink atomically.
+
+### 5.2 `state.json` schema
+
+```json
+{
+  "schema": 1,
+  "role": "writer",
+  "active": "key-20260821-040001",
+  "previous": "key-20260523-040001",
+  "overlap_until": "2026-08-24T04:00:00-04:00",
+  "rotation_interval_days": 90,
+  "overlap_hours": 72,
+  "authorized_keys_comment_prefix": "agent-snapshot",
+  "forced_command": "/bin/bash '/Users/alice/Library/Application Support/agent-snapshot/bin/snapshot-dispatch'",
+  "last_rotate_at": "2026-08-21T04:00:01-04:00",
+  "last_finalize_at": "2026-05-26T04:00:05-04:00",
+  "bootstrap_from_legacy": true
+}
+```
+
+Replica role differs only in `forced_command` (path to `mirror.sh`) and stable symlink name.
+
+### 5.3 Enhanced `authorized_keys` line format
+
+**Writer (source machine):**
+
+```
+restrict,command="/bin/bash '/Users/alice/Library/Application Support/agent-snapshot/bin/snapshot-dispatch'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... agent-snapshot:key-20260821-040001
+```
+
+**Replica (archive host, macOS):**
+
+```
+restrict,command="/bin/bash '/Users/bob/Library/AgentSnapshot/mirror.sh'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... agent-snapshot-replica:key-20260821-040001
+```
+
+**Rules:**
+
+- Comment **must** be `agent-snapshot:<key-id>` or `agent-snapshot-replica:<key-id>` for scripted finalize.
+- During overlap, **two lines** coexist (different comments, same `command=`).
+- Optional hardening: add explicit `no-*` options (already compatible with `restrict`).
+
+Key generation:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "agent-snapshot:${KEY_ID}" -f "${KEY_DIR}/keys/${KEY_ID}"
+```
+
+### 5.4 CLI: `bin/snapshot-key-rotate`
+
+Single script, role-aware. Subcommands:
+
+| Subcommand | Purpose |
+|---|---|
+| `status` | Print active/previous ids, overlap window, key age, pending operator actions |
+| `bootstrap` | Migrate legacy flat key → registry (upgrade path) |
+| `rotate` | Generate new key, enter overlap, update symlink, re-probe |
+| `finalize` | Remove previous pubkey from `authorized_keys`, secure-delete previous private key |
+| `probe` | Role-appropriate test (`localhost probe` or `localhost mirror`) |
+
+**Flags:**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--role writer\|replica` | auto-detect from install paths | Which dispatcher/comment prefix |
+| `--dry-run` | off | Print actions only |
+| `--apply-authorized-keys` | off | Append/remove lines in `~/.ssh/authorized_keys` with timestamped backup |
+| `--force` | off | Skip “snapshot running” guard (use with care) |
+
+**Default remains print-only for `authorized_keys` edits** (consistent with `snapshot-install`). `--apply-authorized-keys` is opt-in for automation-friendly installs.
+
+### 5.5 Pseudocode — `bootstrap`
+
+```
+bootstrap(role):
+  if state.json exists: exit 0 "already bootstrapped"
+
+  legacy = WRITER_LEGACY_PATH or REPLICA_LEGACY_PATH
+  if not file(legacy): exit 1 "no legacy key — run snapshot-install first"
+
+  KEY_ID = "key-legacy-" + date
+  mkdir ~/.ssh/agent-snapshot/keys
+  move legacy + legacy.pub → keys/KEY_ID(+ .pub)
+  rewrite pubkey comment to agent-snapshot:KEY_ID if needed
+
+  write state.json { active: KEY_ID, previous: null, ... forced_command from role }
+
+  ln -sf keys/KEY_ID → stable symlink path
+
+  print "ACTION: ensure authorized_keys comment matches KEY_ID (or run rotate to replace)"
+  print authorized_keys line for current pubkey
+```
+
+### 5.6 Pseudocode — `rotate`
+
+```
+rotate(role, apply_ak, dry_run):
+  load state.json
+  if file(STAGE/.pid) and process alive and not --force:
+    die "snapshot run in progress — retry later"
+
+  if state.previous and now > state.overlap_until:
+    log "auto-finalizing expired overlap before new rotation"
+    finalize(role, apply_ak, dry_run)
+
+  KEY_ID = "key-" + strftime("%Y%m%d-%H%M%S")
+  NEW_PRIV = keys/KEY_ID
+  NEW_PUB  = keys/KEY_ID.pub
+
+  ssh-keygen -t ed25519 -N "" -C "{prefix}:${KEY_ID}" -f NEW_PRIV
+  LINE = build_authorized_keys_line(state.forced_command, NEW_PUB, comment)
+
+  if apply_ak:
+    backup = authorized_keys.bak-YYYYMMDD-HHMMSS
+    cp authorized_keys backup
+    if LINE not in authorized_keys: append LINE
+  else:
+    print "APPEND this line to ~/.ssh/authorized_keys:"
+    print LINE
+    if not apply_ak:
+      print "Then re-run: snapshot-key-rotate rotate --apply-authorized-keys"
+      # OR wait for human append before continuing — implementation choice:
+      # require explicit --apply for steps that mutate symlink (safer)
+
+  # Atomic symlink swap (writer example):
+  ln -sfn keys/KEY_ID stable_symlink_path.tmp
+  mv -f stable_symlink_path.tmp stable_symlink_path
+
+  OLD_ACTIVE = state.active
+  state.previous = OLD_ACTIVE
+  state.active = KEY_ID
+  state.overlap_until = now + overlap_hours
+  state.last_rotate_at = now
+  write state.json
+
+  if probe(role) != 0:
+    # ROLLBACK
+    ln -sfn keys/OLD_ACTIVE stable_symlink_path
+    state.active = OLD_ACTIVE
+    state.previous = null
+    write state.json
+    if apply_ak: remove LINE from authorized_keys (match comment)
+    die "probe failed — rolled back to previous key"
+
+  log "rotation OK; finalize after overlap or successful scheduled runs"
+  print finalize instructions (exact comment to remove later)
+```
+
+**Probe mapping:**
+
+```
+writer:  ssh -i stable_symlink -o IdentitiesOnly=yes -o BatchMode=yes localhost probe
+replica: ssh -i stable_symlink -o IdentitiesOnly=yes -o BatchMode=yes localhost mirror
+         (or deep-verify if mirror is too heavy for rotation gate — prefer mirror)
+```
+
+### 5.7 Pseudocode — `finalize`
+
+```
+finalize(role, apply_ak, dry_run):
+  load state.json
+  if state.previous is null: exit 0 "nothing to finalize"
+
+  PREV = state.previous
+  COMMENT = "{prefix}:${PREV}"
+
+  if now < state.overlap_until:
+    warn "still inside overlap window — ensure new key has succeeded in production"
+    unless --force: require confirmation or successful_run_count >= N
+
+  if apply_ak:
+    backup authorized_keys
+    remove lines where comment ends with COMMENT (exact match)
+    verify exactly one agent-snapshot* line remains (or two if mid-overlap error)
+  else:
+    print "REMOVE line with comment ${COMMENT}"
+
+  shred -u keys/PREV keys/PREV.pub  # or rm -P on macOS
+  state.previous = null
+  state.overlap_until = null
+  state.last_finalize_at = now
+  write state.json
+```
+
+### 5.8 Rotation trigger and schedule
+
+**Config** (add to `conf/snapshot.conf` and replica env / small `archive-host/replica.conf`):
+
+```bash
+KEY_ROTATION_ENABLED=true
+KEY_ROTATION_DAYS=90          # rotate if active key older than this
+KEY_OVERLAP_HOURS=72          # keep previous key valid
+KEY_ROTATION_APPLY_AK=false   # default print-only; set true only if operator accepts auto-edit
+```
+
+**launchd template:** `launchd/com.agent-snapshot.key-rotate.plist.template`
+
+```xml
+<!-- Weekly check, Sunday 04:00 local (before typical snap jobs) -->
+<key>StartCalendarInterval</key>
+<dict>
+  <key>Weekday</key><integer>0</integer>
+  <key>Hour</key><integer>4</integer>
+  <key>Minute</key><integer>0</integer>
+</dict>
+<key>ProgramArguments</key>
+<array>
+  <string>/bin/bash</string>
+  <string>__HOME__/Library/Application Support/agent-snapshot/bin/snapshot-key-rotate</string>
+  <string>rotate-if-due</string>
+  <string>--role</string><string>writer</string>
+</array>
+```
+
+`rotate-if-due` subcommand:
+
+```
+if age(active) >= KEY_ROTATION_DAYS: rotate
+if state.previous and now > overlap_until and probe_ok(active): finalize
+else: status (log only)
+```
+
+**Manual:**
+
+```bash
+bin/snapshot-key-rotate status
+bin/snapshot-key-rotate rotate --apply-authorized-keys   # after reviewing printed line
+bin/snapshot-key-rotate finalize --apply-authorized-keys
+```
+
+Replica: same script copied to archive host (or single script in repo installed to both). Archive launchd is operator-authored today — add parallel template `launchd/com.agent-snapshot-replica.key-rotate.plist.template` in `archive-host/`.
+
+### 5.9 Operational cutover (what the operator sees)
+
+**Happy path (auto-apply enabled):**
+
+1. Sunday 04:00: `rotate-if-due` generates `key-20260821-…`, appends `authorized_keys` line, flips symlink, probe passes.
+2. Mon–Wed: both keys work. Scheduled snaps use new key via symlink. Any stale manual `-i keys/old` still works until finalize.
+3. Wednesday 04:00: overlap expired, finalize removes old line + deletes old private key.
+4. `status` shows one active key, age 0 days.
+
+**Happy path (print-only default, OSS-safe):**
+
+1. Job prints new line + exits non-zero with “pending authorized_keys append” **OR** rotates symlink only after detecting the new line in `authorized_keys` (safer variant — **recommended**).
+2. Operator/agent appends line (same AGENT-SETUP discipline: `wc -l` before/after).
+3. Operator runs `snapshot-key-rotate rotate --continue` or re-runs rotate with `--apply-authorized-keys`.
+4. After 72h, operator runs `finalize`.
+
+**Recommended gate for print-only mode:** Do not flip symlink until `grep -F "agent-snapshot:${NEW_ID}" authorized_keys` succeeds. Prevents lockout where client uses new private key but server doesn’t accept it yet.
+
+### 5.10 Failure modes and handling
+
+| Scenario | Behavior |
+|---|---|
+| **Rotation mid-snapshot** | `rotate` checks `$STAGE/.pid` (same lock as `bin/snapshot` lines 40–49). Defer rotation. Overlap design means even concurrent rotate + snap is safe once new AK line exists. |
+| **New line not appended (print-only)** | Symlink not flipped until pubkey present in `authorized_keys`. Old key continues working. `status` shows `PENDING: append …`. |
+| **Probe fails after symlink flip** | Automatic rollback to previous active key + remove newly appended line if `--apply`. Log loudly. |
+| **Archive host unreachable** | Irrelevant for **writer** rotation (localhost only). **Replica** rotation is also localhost on archive host. |
+| **Finalize with active jobs using old key** | Overlap window + optional `--force` delay. Old key removal only after `overlap_until`. Scheduled jobs use symlink → always active key. |
+| **First-ever install** | `snapshot-install` creates legacy key → first `bootstrap` on first `rotate-if-due` or explicit `bootstrap`. First **rotation** (not install) introduces overlap; nothing to finalize on first rotate after bootstrap until a *second* rotation. |
+| **Upgrade from existing deployments** | `bootstrap` moves existing key into registry without forcing immediate rotation. Operator optionally updates comment in AK to include key id. |
+| **Human deletes wrong AK line** | `probe` fails; `status` shows mismatch. Recovery: re-print line from `keys/<active>.pub`. Installer/rotate never deletes active line automatically except `finalize` of `previous` only. |
+| **Two-machine: only rotated writer** | Supported. Replica unchanged. |
+| **Monitor / logs** | Append to `~/.ssh/agent-snapshot/rotation.log` and monthly `~/Library/Logs/agent-snapshot/YYYY-MM.log` with `key-rotate: …` lines for liveness. |
+
+### 5.11 Caller distinction (optional v1.1 add-on)
+
+Extend registry to support **slots**:
+
+```
+keys/scheduled-20260821-…   # launchd only
+keys/interactive-20260821-… # human/AI ad-hoc
+```
+
+Two AK lines, same command, rotate independently. **Not required for v1** but comment schema supports it (`agent-snapshot:scheduled:KEY_ID`).
+
+---
+
+## 6. Phase 2 Design Sketch — SSH CA Mode (Optional)
+
+For operators who want **short validity per invocation** without rotating pubkeys weekly.
+
+### 6.1 Install changes
+
+`snapshot-install --auth-mode certificate` generates:
+
+```
+~/.ssh/agent-snapshot/ca/user_ca           # CA private (0600, Keychain optional)
+~/.ssh/agent-snapshot/ca/user_ca.pub
+~/.ssh/agent-snapshot/keys/invoke_key      # long-lived *signing* keypair (not in authorized_keys)
+```
+
+Single `authorized_keys` line:
+
+```
+@cert-authority,restrict,command="/bin/bash '…/snapshot-dispatch'",no-pty ssh-ed25519 AAAA... agent-snapshot-ca:v1
+```
+
+### 6.2 Invocation wrapper — `bin/snapshot-invoke`
+
+Replace raw `ssh` in launchd plists:
+
+```
+snapshot-invoke <mode>    # snap | vault | both | probe | mirror | deep-verify
+
+  CERT_ID=$(uuid)
+  ssh-keygen -s ca/user_ca -I "$CERT_ID" -n "$USER" -V +10m \
+    -O clear -O force-command="/bin/bash '…/snapshot-dispatch'" \
+    keys/invoke_key.pub > /tmp/cert.$CERT_ID.pub
+
+  ssh -i keys/invoke_key -o CertificateFile=/tmp/cert.$CERT_ID.pub \
+      -o IdentitiesOnly=yes … localhost "$MODE"
+  rm -f /tmp/cert.$CERT_ID.pub
+```
+
+**Note:** `-O force-command` in cert may duplicate AK command — test on target OpenSSH version; may rely on AK command only.
+
+### 6.3 CA rotation
+
+Rotate **`user_ca.pub`** in `authorized_keys` with same overlap pattern as Option A, not per-invocation keys.
+
+**Why Phase 2:** CA custody, OpenSSH version matrix, and launchd wrapper complexity are too heavy for v1 default.
+
+---
+
+## 7. File-Level Implementation Plan
+
+### 7.1 New files
+
+| Path | Purpose |
+|---|---|
+| `bin/snapshot-key-rotate` | Unified rotation CLI (writer + replica roles) |
+| `launchd/com.agent-snapshot.key-rotate.plist.template` | Weekly `rotate-if-due` on source |
+| `launchd/com.agent-snapshot-replica.key-rotate.plist.template` | Same for archive host |
+| `docs/KEY-ROTATION.md` | Operator runbook (append/finalize gates, failure recovery) |
+| `archive-host/key-rotate.md` | Pointer to shared script + replica-specific paths |
+
+Optional v2:
+
+| Path | Purpose |
+|---|---|
+| `bin/snapshot-invoke` | CA cert minting + ssh wrapper |
+| `docs/KEY-ROTATION-CA.md` | Advanced CA mode |
+
+### 7.2 Modified files
+
+| Path | Changes |
+|---|---|
+| `bin/snapshot-install` | (1) After key create, call `snapshot-key-rotate bootstrap --role writer` or inline equivalent. (2) Create stable symlink to keyed storage. (3) Print AK line with `agent-snapshot:KEY_ID` comment. (4) Render key-rotate launchd plist when `KEY_ROTATION_ENABLED` (default true). (5) Copy `snapshot-key-rotate` into `$APPDIR/bin/`. |
+| `bin/snapshot-dispatch` | Optional: log key comment from `SSH_USER_AUTH` / env if available (OpenSSH 8.x+ may expose cert identity). No auth logic change. |
+| `archive-host/mirror.sh` | No functional change; optional log line on dispatch. |
+| `archive-host/README.md` | Document replica key registry, symlink, rotation schedule, AK comment format. Replace ad-hoc keygen with `snapshot-key-rotate bootstrap --role replica`. |
+| `launchd/com.agent-snapshot.leg.plist.template` | **No path change** if symlink stable. Optional: add `-o IdentityFile=…` only if symlink insufficient on some OpenSSH builds (test). |
+| `conf/snapshot.conf.example` | Add `KEY_ROTATION_*` settings. |
+| `AGENT-SETUP.md` | New Phase 1.5: bootstrap/rotation awareness; probe after rotation. |
+| `docs/SAFETY.md` | New §: credential lifetime / rotation guarantees and limits. |
+| `docs/DESIGN.md` | Roadmap item → implemented pointer. |
+| `README.md` | One paragraph on automatic key rotation. |
+| `archive-host/selftest.sh` | Unit tests for AK line builder, comment parse, state transitions (mock filesystem). |
+| `monitor/monitor.py` | Optional: surface `last_rotate_at` / “key age N days” from state file (read-only). |
+
+### 7.3 Shared shell functions (extract from install)
+
+Refactor `bin/snapshot-install` to source `bin/snapshot-key-lib.sh`:
+
+- `ak_line(forced_command, pub_file, comment)`
+- `render_launchd_leg(…)` (existing)
+- `render_launchd_key_rotate(…)` (new)
+- `stable_key_path(role)`
+
+Both install and rotate use the same AK line builder — **one source of truth** for `restrict,command=…`.
+
+---
+
+## 8. Security Properties After Implementation
+
+| Property | v1 overlap rotation | v2 CA mode |
+|---|---|---|
+| Stolen key expires automatically | After at most `ROTATION_DAYS + OVERLAP_HOURS` if rotation runs | Cert valid ≤10m; CA still long-lived |
+| Containment preserved | Yes | Yes |
+| No sshd config required | Yes | Yes (CA uses standard `@cert-authority`) |
+| Revocation without login | No — needs AK edit | CA revoke + overlap |
+| Per-caller credentials | Optional slots | Optional separate invoke keys |
+| Survives missed rotation schedule | Old key works forever (status quo) until rotated | Same — operational discipline required |
+
+**Honest limit:** Rotation reduces **indefinite** exposure to **bounded** exposure. It does not replace containment. Alerting on `key age > ROTATION_DAYS + grace` should be documented (monitor integration optional).
+
+---
+
+## 9. Open Questions / Risks
+
+| # | Question | Recommendation |
+|---|---|---|
+| 1 | Should `--apply-authorized-keys` ever be default? | **No** for OSS. Document opt-in. Safer: never flip symlink until new line detected. |
+| 2 | Auto-finalize vs manual finalize? | Auto-finalize after `overlap_until` **if** ≥N successful probes/schedules; else warn in logs. |
+| 3 | Linux archive host replica | No forced-command hop today (plain cron). Rotation scope: **macOS replica only**. Linux uses normal cron — out of scope unless later unified. |
+| 4 | Third hop (rsync to archive) | Track separately; mention in KEY-ROTATION.md as recommended follow-on. |
+| 5 | Key encryption at rest | ed25519 with empty passphrase matches today. Optional `-N passphrase` breaks unattended launchd unless Keychain integration — defer. |
+| 6 | Multi-user machines | State in `$HOME/.ssh/agent-snapshot` per user — correct. Document that rotation is per installing user. |
+| 7 | Concurrent manual `-i old_key` after finalize | Fails as expected — document. |
+| 8 | OpenSSH on older macOS | Test `@cert-authority` and cert `-V` on minimum supported macOS before Phase 2. |
+| 9 | Agent-driven install | Update AGENT-SETUP: after append, run `bootstrap`; never `finalize` in same session as `rotate`. |
+| 10 | Coexistence with other forced-command jobs | Writer rotation must not rewrite unrelated AK entries. Line removal matches **exact comment suffix** only. |
+
+---
+
+## 10. Implementation Order (Suggested Sprint)
+
+1. **`snapshot-key-lib.sh`** — AK line builder, paths, comment parsing.
+2. **`snapshot-key-rotate bootstrap|status|probe`** — migration + observability.
+3. **`snapshot-install` integration** — symlink layout, new comment format, copy rotate script.
+4. **`rotate|finalize|rotate-if-due`** — core logic + rollback + tests in `archive-host/selftest.sh` (shell functions sourced in test mode).
+5. **launchd template + docs** — KEY-ROTATION.md, AGENT-SETUP, SAFETY updates.
+6. **Archive host docs + replica template** — parallel path.
+7. **(Later)** `snapshot-invoke` + CA mode docs.
+
+---
+
+## 11. Summary
+
+| Approach | Fit for agent-snapshot forced-command SSH |
+|---|---|
+| **A: Overlap rotation** | **Primary — implement v1** |
+| **B: Token-push files** | **Reject** — wrong auth layer |
+| **C: SSH CA short-lived certs** | **Optional Phase 2** for invocation-scoped validity |
+| **D: Caller-scoped keys** | **Additive** to A |
+
+The existing architecture deliberately separates **transport containment** (forced command + allowlist) from **credential lifecycle**. v1 adds lifecycle with minimal moving parts: keyed registry, stable symlink, dual `authorized_keys` lines during overlap, probe-gated cutover, and opt-in automated AK editing. That gives third-party deployers a concrete, operable rotation story without forking sshd or misunderstanding fleet’s OAuth pattern as SSH pubkey rotation.

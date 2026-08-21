@@ -1,0 +1,591 @@
+# Rate-Limit Design: Burst Detection for Forced-Command Dispatchers
+
+**Status:** Planning only (implementation spec for tomorrow)  
+**Scope:** Source `bin/snapshot-dispatch` and archive `archive-host/mirror.sh`  
+**Primary driver:** Verified indirect data-loss path via `prune_snap_to_fit()`
+
+---
+
+## 1. Problem Statement
+
+### 1.1 Verified source-side abuse path
+
+The scheduling SSH key is forced-command locked to `snapshot-dispatch`, which only allows `snap|vault|both|probe`. That containment is real — the key cannot run `rm`, open a shell, or choose arbitrary commands.
+
+However, **`snap` and `both` are not harmless when repeated**. In `backup_snap()`:
+
+```98:107:bin/snapshot
+  log "[snap] free space: ${freegb}G (floor ${SNAP_MIN_FREE_GB}G)"
+  if [ "${freegb:-0}" -lt "$SNAP_MIN_FREE_GB" ]; then
+    log "[snap] below floor — pruning oldest snapshots to make room"
+    prune_snap_to_fit
+    freegb=$(snap_free_gb)
+    if [ "${freegb:-0}" -lt "$SNAP_MIN_FREE_GB" ]; then
+      log "[snap] STILL below floor (${freegb}G) — aborting"
+      RESULTS+=("snap: FAILED (low disk ${freegb}G)"); RC=1; return 1
+    fi
+  fi
+```
+
+`prune_snap_to_fit()` deletes **exactly one** oldest snapshot per invocation (only if more than one exists):
+
+```174:182:bin/snapshot
+prune_snap_to_fit() {
+  local rdir
+  rdir="$(snap_path)"
+  ssh $SSH_OPTS "$SNAP_SSH" "
+    cd '$rdir' 2>/dev/null || exit 0
+    list=\$(ls -1 | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_' | sort)
+    count=\$(echo \"\$list\" | grep -c .)
+    if [ \"\$count\" -gt 1 ]; then rm -rf \"\$(echo \"\$list\" | head -1)\"; fi"
+}
+```
+
+**Attack:** A holder of the source-side forced-command key triggers `snap` or `both` repeatedly (waiting for each run to finish; concurrent triggers are mostly no-ops — see §1.3). When the DAS is at or near `SNAP_MIN_FREE_GB`, each completed run can force one retention-policy bypass deletion. The attacker never issues a delete command; they induce the writer’s own free-space logic to do it, one snapshot per successful run, rate-limited only by backup duration.
+
+This is indirect, slow, but **real data loss** — not mere DoS.
+
+### 1.2 Verified archive-side abuse path
+
+Archive host has a structurally identical forced-command dispatcher:
+
+```1:14:archive-host/mirror.sh
+#!/bin/bash
+# ...
+case "$mode" in
+  mirror|deep-verify) ;;
+  *) mode=mirror ;;
+esac
+exec /usr/bin/python3 "$here/engine.py" "$mode"
+```
+
+**`mirror` spam:** Engine already serializes with `flock` — overlapping passes exit 2 (`skip: already running`). Spam still wastes CPU/IO and can delay legitimate poll/kick passes.
+
+**`deep-verify` spam:** High cost — SEMANTICS.md documents ~2–3 minutes per ~150k-file snapshot walk; at high backup cadence a nightly pass can already run 30–70 minutes. Repeated forced `deep-verify` triggers are a cheap availability attack against the archive host and the monitor (P5/P13 signal noise).
+
+### 1.3 Existing overlap behavior (not sufficient)
+
+`bin/snapshot` single-instance lock exits **0** when another run is active:
+
+```39:47:bin/snapshot
+LOCK="$STAGE/.lock"
+exec 9>"$LOCK"
+if ! flock -n 9 2>/dev/null; then
+  if [ -f "$STAGE/.pid" ] && kill -0 "$(cat "$STAGE/.pid" 2>/dev/null)" 2>/dev/null; then
+    log "another snapshot run is already active (pid $(cat "$STAGE/.pid")) — exiting"
+    exit 0
+  fi
+fi
+```
+
+That prevents concurrent work but:
+- Does **not** stop back-to-back serial triggers after each run completes.
+- **Silently succeeds** (exit 0) — wrong semantics for abuse detection.
+- Does not apply at all on the archive side before Python starts.
+
+### 1.4 Goal
+
+Detect **anomalous bursts** of triggers from the same credential/lane and **refuse** them:
+- Not queue
+- Not silently ignore
+- Not run anyway
+
+Must **never** block:
+- Legitimate manual on-demand runs (including “run it twice in a few minutes while testing”)
+- Normal scheduled cadence (as tight as ~4×/day ≈ one trigger every 4–6 hours; must not hardcode that schedule)
+
+---
+
+## 2. Where Enforcement Lives
+
+| Location | Enforce? | Reason |
+|---|---|---|
+| **`bin/snapshot-dispatch`** | **Yes — primary chokepoint** | Every source-side scheduled and manual trigger passes through here before `bin/snapshot` runs. |
+| **`archive-host/mirror.sh`** | **Yes — independent equivalent** | Separate machine, separate forced-command key, separate threat lane. |
+| **`bin/snapshot`** | **No** | Too late; abuse side effects already started. Also bypassed if someone runs `snapshot` directly with shell access (out of scope — full compromise). |
+| **`archive-host/engine.py`** | **Partial — observability only** | Read denial artifacts and surface **P16** on the monitor; do not put the gate only inside engine (Python startup cost; writer-kick path must be handled at entry). |
+
+**Writer-kick exemption:** After every successful snap, the source runs `REPLICA_KICK` over normal `SNAP_SSH` (not the replica forced-command key):
+
+```146:151:bin/snapshot
+  if [ -n "${REPLICA_KICK:-}" ]; then
+    if ssh $SSH_OPTS "$SNAP_SSH" "$REPLICA_KICK"; then
+      log "[snap] replica pass started on archive host"
+```
+
+That invokes `mirror.sh` **directly on the archive host shell**, bypassing the replica-key forced-command path. Archive rate limiting must:
+1. Apply strictly to **forced-command invocations** (replica key abuse).
+2. **Exempt writer kicks** (see §4.2).
+
+**Required config change (small, explicit):**
+
+```bash
+# conf/snapshot.conf.example / snapshot-install generated conf
+REPLICA_KICK='AGENT_SNAPSHOT_KICK=1 nohup "$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'
+```
+
+`mirror.sh` skips rate limiting when `AGENT_SNAPSHOT_KICK=1`.
+
+---
+
+## 3. Thresholds (Exact Values + Reasoning)
+
+Use a **sliding window** of accepted-trigger timestamps. Two windows: a **short burst window** (back-to-back) and a **medium window** (sustained abuse). Deny when **either** limit is exceeded.
+
+### 3.1 Source machine (`snap`, `vault`, `both`)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `SNAP_RATE_BURST_COUNT` | **3** | Max accepted triggers in burst window |
+| `SNAP_RATE_BURST_WINDOW_SEC` | **600** (10 min) | Burst window |
+| `SNAP_RATE_SUSTAIN_COUNT` | **5** | Max accepted triggers in sustain window |
+| `SNAP_RATE_SUSTAIN_WINDOW_SEC` | **3600** (60 min) | Sustain window |
+
+**Deny rule:** Refuse request if either:
+- ≥ **4** triggers in the last **10 minutes**, OR
+- ≥ **6** triggers in the last **60 minutes**
+
+(Equivalently: allow 3 in 10 min and 5 in 60 min; deny on the next one.)
+
+**Modes counted:** `snap`, `vault`, `both` (each dispatch request = 1).  
+**Modes excluded:** `probe` (read-only by contract — must remain “safe anytime”).
+
+**Why this line is correct:**
+
+| Scenario | Triggers | Result |
+|---|---|---|
+| Human test + retry | 2 in 5 min | **Allowed** |
+| Test snap, then `both`, then one retry | 3 in 10 min | **Allowed** |
+| 4×/day schedule | ~1 per 4–6 h | **Never near limits** |
+| snap + vault launchd at same minute | 2 in 1 min | **Allowed** |
+| Attack loop | 4+ in 10 min | **Denied** |
+| Slow attack | 6+ in 60 min | **Denied** |
+
+The burst window catches back-to-back abuse; the sustain window catches “one deletion per run” pacing spread over an hour.
+
+### 3.2 Archive host — forced-command path only
+
+Two mode-specific policies:
+
+#### A. `mirror` (includes unrecognized → mirror mapping)
+
+| Parameter | Default |
+|---|---|
+| `SNAP_RATE_MIRROR_BURST_COUNT` | **4** |
+| `SNAP_RATE_MIRROR_BURST_WINDOW_SEC` | **300** (5 min) |
+
+Deny on **5th** forced-command `mirror` within 5 minutes.
+
+**Why not tighter:** Reference poll interval is **300 s** (`StartInterval` in archive-host README) → **12 legitimate mirror triggers/hour** from launchd alone. A 60-minute cap below ~12 would break production. Burst detection targets **back-to-back** spam (many within minutes), not the steady 5-minute poll.
+
+Writer kick (`AGENT_SNAPSHOT_KICK=1`) is **exempt** — not counted, not denied.
+
+#### B. `deep-verify`
+
+| Parameter | Default |
+|---|---|
+| `SNAP_RATE_VERIFY_COUNT` | **2** |
+| `SNAP_RATE_VERIFY_WINDOW_SEC` | **86400** (24 h) |
+
+Deny on **3rd** forced-command `deep-verify` within 24 hours.
+
+**Why:** Reference deployment runs deep-verify **once daily**. Allow 2 (failure retry + manual re-run); deny sustained spam that would burn hours of USB walks.
+
+---
+
+## 4. State Tracking
+
+### 4.1 Source state files
+
+| Path | Purpose |
+|---|---|
+| `~/Library/Application Support/agent-snapshot/state/trigger-history.json` | Sliding-window timestamps |
+| `~/Library/Application Support/agent-snapshot/state/trigger-history.lock` | Short-lived `flock` for RMW |
+| `~/Library/Application Support/agent-snapshot/state/last-rate-limit.json` | Last denial (flag/audit) |
+
+Matches existing conventions: app data under **Application Support** (see `snapshot-dispatch` `APPDIR`), logs stay in **Logs** (`dispatch.log`).
+
+**Directory creation:** `mkdir -p` with `umask 077` (or explicit `chmod 700`).
+
+**File permissions:** `0600` on JSON files, `0700` on `state/`. Owner = install user.
+
+### 4.2 Archive state files
+
+| Path | Purpose |
+|---|---|
+| `~/Library/AgentSnapshot/trigger-history.json` | Same schema, archive lanes |
+| `~/Library/AgentSnapshot/trigger-history.lock` | flock |
+| `~/Library/AgentSnapshot/last-rate-limit.json` | Last denial for P16 |
+
+Matches `DEFAULT_STATE_DIR = ~/Library/AgentSnapshot` used by `engine.py`.
+
+### 4.3 JSON schema
+
+```json
+{
+  "schema": 1,
+  "lane": "source-forced",
+  "entries": [
+    {
+      "ts": 1724210400,
+      "mode": "snap",
+      "client": "127.0.0.1 49152 22"
+    }
+  ]
+}
+```
+
+**Archive lanes:**
+- `archive-forced-mirror`
+- `archive-forced-deep-verify`
+- (writer kick: **no entry written**)
+
+**Retention in file:** On each check, drop entries with `ts < now - max(window)`. Cap at 64 entries per lane (safety bound).
+
+### 4.4 Concurrency / locking
+
+Use **`flock -x` on `trigger-history.lock`** for the full read–prune–check–append–write cycle (~milliseconds). Do **not** hold this lock while executing `snapshot` or `engine.py`.
+
+**Interaction with existing locks:**
+
+| Lock | Holder | Relationship |
+|---|---|---|
+| `STAGE/.lock` | `bin/snapshot` for entire run | Independent. Dispatch should **probe** this lock (non-blocking) *before* consuming a rate slot. |
+| `mirror.pid` flock | `engine.py` for entire pass | Independent. Optional mirror-side probe before counting. |
+| `trigger-history.lock` | Dispatch rate check only | New; no nesting with the above. |
+
+**Recommended order at source dispatch:**
+1. Mode allowlist (existing)
+2. If `probe` → skip rate limit
+3. Non-blocking check: is `bin/snapshot` already running? → exit **79**, **no** history entry
+4. Acquire `trigger-history.lock`
+5. Prune + evaluate windows
+6. If deny → write `last-rate-limit.json`, release lock, exit **78**
+7. Append entry, release lock
+8. `exec snapshot`
+
+---
+
+## 5. Dispatcher Logic (Pseudocode)
+
+### 5.1 Shared primitives (implement twice: bash source, bash archive)
+
+```
+function rate_prune(entries, now, window_sec):
+  return [e for e in entries if e.ts >= now - window_sec]
+
+function rate_count(entries, now, window_sec):
+  return len(rate_prune(entries, now, window_sec))
+
+function rate_deny_reason(count_burst, burst_limit, count_sustain, sustain_limit):
+  if count_burst >= burst_limit: return "burst"
+  if count_sustain >= sustain_limit: return "sustain"
+  return null
+
+function rate_commit(history_path, lock_path, lane, mode, client):
+  flock(lock_path, exclusive):
+    h = read_json(history_path) or {schema:1, lane, entries:[]}
+    h.entries = rate_prune(h.entries, now, MAX_WINDOW)
+    h.entries.append({ts: now, mode, client})
+    write_atomic(history_path, h)   # tmp + replace, same pattern as engine.py
+```
+
+Use `write_atomic` semantics: write temp file in same directory, `fsync`, `rename`.
+
+### 5.2 `bin/snapshot-dispatch` (source)
+
+```
+APPDIR="$HOME/Library/Application Support/agent-snapshot"
+STATE_DIR="$APPDIR/state"
+HISTORY="$STATE_DIR/trigger-history.json"
+LOCK="$STATE_DIR/trigger-history.lock"
+LAST_DENY="$STATE_DIR/last-rate-limit.json"
+# Load thresholds from conf (source defaults above if unset)
+
+MODE="${SSH_ORIGINAL_COMMAND:-}"
+CLIENT="${SSH_CLIENT:-unknown}"
+log "request mode=[$MODE] client=[$CLIENT] pid=$$"
+
+case "$MODE" in
+  snap|vault|both)
+    # --- already running? (do not consume quota) ---
+    STAGE=$(conf STAGE default "$HOME/Library/Caches/agent-snapshot")
+    if snapshot_lock_held("$STAGE/.lock"):
+      log "BUSY already-running mode=$MODE"
+      echo "snapshot-dispatch: busy — snapshot already running" >&2
+      exit 79
+
+    # --- rate limit ---
+    now=$(date +%s)
+    flock LOCK:
+      h = read HISTORY
+      entries = h.entries filtered to snap|vault|both modes
+      burst_n  = count entries in last BURST_WINDOW
+      sustain_n = count entries in last SUSTAIN_WINDOW
+
+      if burst_n >= BURST_COUNT or sustain_n >= SUSTAIN_COUNT:
+        reason = which window tripped
+        next_allowed = ts of oldest relevant entry + window
+        write LAST_DENY {ts, mode, reason, burst_n, sustain_n, client, next_allowed}
+        log "DENIED rate-limit mode=$MODE reason=$reason burst=$burst_n sustain=$sustain_n client=$CLIENT"
+        echo "snapshot-dispatch: denied — rate limit ($MODE): $reason threshold exceeded; retry after $(date -r $next_allowed)" >&2
+        exit 78
+
+      append entry {ts:now, mode, client}
+      write HISTORY
+
+    log "-> exec snapshot $MODE"
+    exec bash "$BIN" "$MODE"
+
+  probe)
+    # unchanged — no rate limit
+
+  *)
+    log "REFUSED unknown mode [$MODE]"
+    echo "snapshot-dispatch: refused (allowed: snap | vault | both | probe)" >&2
+    exit 77
+esac
+```
+
+**Config sourcing:** Add optional vars to `conf/snapshot.conf.example` (defaults baked into dispatch if unset). Install script may omit — defaults must be safe for OSS.
+
+### 5.3 `archive-host/mirror.sh` (archive)
+
+```
+here=dirname of mirror.sh
+STATE_DIR="$HOME/Library/AgentSnapshot"   # or env SNAP_STATE_DIR
+# ...
+
+mode=arg1 or SSH_ORIGINAL_COMMAND or default mirror
+case "$mode" in mirror|deep-verify) ;; *) mode=mirror ;; esac
+
+# --- Writer kick exemption ---
+if [ "$AGENT_SNAPSHOT_KICK" = "1" ]; then
+  exec python3 "$here/engine.py" "$mode"
+fi
+
+# --- Forced-command detection ---
+# Exempt non-SSH direct manual runs from strict limits? Recommended:
+#   Apply limits only when SSH_CONNECTION is set (ssh-invoked).
+#   Manual `bash mirror.sh mirror` from operator shell: exempt OR use same generous limits.
+forced=0
+[ -n "${SSH_CONNECTION:-}" ] && forced=1
+
+if [ "$forced" -eq 0 ]; then
+  exec python3 "$here/engine.py" "$mode"
+fi
+
+# --- Optional: engine already running? ---
+if engine_lock_held("$STATE_DIR/mirror.pid"):
+  echo "mirror.sh: busy — engine already running" >&2
+  exit 79
+
+# --- Mode-specific rate check (forced path only) ---
+case "$mode" in
+  mirror)
+    BURST_COUNT=4; WINDOW=300
+    lane="archive-forced-mirror"
+  deep-verify)
+    COUNT=2; WINDOW=86400
+    lane="archive-forced-deep-verify"
+esac
+
+# flock + check + maybe deny (exit 78) + append + write last-rate-limit.json
+# on deny: append one line to SNAP_LOG if set
+
+exec python3 "$here/engine.py" "$mode"
+```
+
+**Legitimate post-snapshot replica kick:** Runs with `AGENT_SNAPSHOT_KICK=1` → **bypasses** all rate checks. Launchd poll 5 min later uses forced-command path → counted separately in `archive-forced-mirror` lane → well under burst limit (1 per 5 min << 4 per 5 min).
+
+**Coincidence case:** Kick + attacker forced mirror within same minute = 2 forced + 1 kick(exempt) → OK. Kick exempt + 4 attacker mirrors in 5 min → 5th denied.
+
+---
+
+## 6. Deny / Flag Behavior Spec
+
+### 6.1 Exit codes
+
+| Code | Meaning | Existing? |
+|---|---|---|
+| **0** | Success | Yes |
+| **1** | Probe/snapshot operational failure | Yes |
+| **77** | Unrecognized mode (allowlist refusal) | Yes — `snapshot-dispatch` |
+| **78** | **Rate limit denial (NEW)** | **New — distinct from 77** |
+| **79** | **Already running at dispatcher (NEW, recommended)** | New — explicit busy, not spam |
+| **2** | Engine pass skipped (lock held) | Yes — archive engine |
+| **3** | Engine fatal/config | Yes — archive engine |
+
+SSH clients and launchd will see nonzero exit on 78/79. Launchd will retry on next schedule — correct.
+
+### 6.2 Deny output (required — loud, not silent)
+
+**stderr (human + ssh client):**
+```
+snapshot-dispatch: denied — rate limit (snap): burst threshold exceeded (4 in 10 min, max 3); retry after 2026-08-21 04:19:00
+```
+
+**dispatch.log / archive SNAP_LOG:**
+```
+2026-08-21 04:09:00  DENIED rate-limit mode=snap reason=burst burst=4 sustain=2 client=127.0.0.1:49152 window_burst=600 window_sustain=3600
+```
+
+**Do not** exec downstream script on 78/79.
+
+### 6.3 Flag artifacts
+
+#### Source (no monitor today)
+
+Write `last-rate-limit.json`:
+```json
+{
+  "schema": 1,
+  "ts": 1724210400,
+  "iso": "2026-08-21T04:09:00-0400",
+  "mode": "snap",
+  "reason": "burst",
+  "burst_count": 4,
+  "sustain_count": 2,
+  "client": "127.0.0.1 49152 22",
+  "retry_after_ts": 1724210940
+}
+```
+
+**Observability:** `tail -f ~/Library/Logs/agent-snapshot/dispatch.log | grep DENIED` — matches existing operator habit. **No new monitor plumbing required for v1.**
+
+Optional follow-up: source-side status file + menu-bar monitor — out of scope for initial implementation.
+
+#### Archive (monitor exists)
+
+On deny, `mirror.sh` writes the same `last-rate-limit.json` under `~/Library/AgentSnapshot/`.
+
+**`engine.py` change (observability pass):** In `compute_health()`, if `last-rate-limit.json` exists and `ts` within last **24 h**:
+
+```python
+self.problem("P16 forced-command trigger rate-limited (%s): %s at %s — possible abuse of replica key"
+             % (mode, reason, iso))
+```
+
+Also append to `events.jsonl`:
+```json
+{"ts":"...","kind":"rate_limited","mode":"deep-verify","detail":"burst 3 in 600s"}
+```
+
+**Monitor display:** P16 appears in `problems[]` → `display_state=fail` (same as P1–P15). Clear P16 when:
+- No new denial in 24 h, OR
+- Operator deletes `last-rate-limit.json` (document for support)
+
+**Distinction:** P16 = “someone tried to spam triggers”; P5/P13 = verification health. Different causes.
+
+---
+
+## 7. Adversarial Analysis / Defeat Attempts
+
+### 7.1 Reset or delete state file
+
+| Attacker capability | Can reset state? |
+|---|---|
+| **Forced-command key only** (design threat) | **No.** No shell, no file access. Only dispatch/mirror entrypoints run. |
+| **Full user account on source/archive** | **Yes.** Can `rm` history or edit JSON. Rate limit is **defense-in-depth for key-only abuse**, consistent with SAFETY.md (“compromised source + stolen backup key”). Full compromise is explicitly out of guarantee scope. |
+| **Archive host shell** | Can wipe drives entirely — already acknowledged in SAFETY §6. |
+
+**Hardening:** State dir `0700`, files `0600`, owned by backup user. No group/world permissions. Even another local user on same Mac (without admin) cannot tamper unless they have that uid.
+
+### 7.2 Route around dispatcher
+
+| Bypass | Mitigation |
+|---|---|
+| Direct `bin/snapshot` with shell | Out of scope (requires shell, not key-only). |
+| Different SSH key without forced command | Out of scope (operator misconfiguration). |
+| `probe` spam | Excluded intentionally — read-only; no prune path. Could add separate probe limit later if needed. |
+| Archive: writer kick path | Exempt by design — trusted path from source’s normal SSH identity; abuse there is source-side rate limit’s job. |
+| Archive: poll + kick | Legitimate; thresholds sized to allow. |
+
+### 7.3 Attribution / multiple connections
+
+Source deployment uses **one** dedicated scheduling key; all forced-command triggers share one lane. `SSH_CLIENT` logged for forensics but not used for bucketing (127.0.0.1 for both launchd and manual).
+
+Archive replica key: same — single lane per mode. If future multi-key support is added, bucket by `SSH_USER_AUTH` or key fingerprint from environment (OpenSSH-specific) — document as extension point, not v1 requirement.
+
+### 7.4 Slow low-and-slow attack
+
+At 3 per 10 min max accepted, attacker near disk floor could still delete up to **~3 oldest snapshots per 10 minutes** — much faster than retention intends, but rate limit reduces worst case from unbounded. Sustain window (5/hour) further caps. **Known limitation** — this is abuse mitigation, not a perfect retention guarantee under sustained key abuse while disk is pinned at floor.
+
+### 7.5 Lock race: two simultaneous ssh sessions
+
+`flock` on history serializes counting — only one append wins per window evaluation; both may read “2 in window”, one writes 3rd, second writes 4th or denies — acceptable; no under-count that allows unbounded bypass.
+
+---
+
+## 8. Configuration Surface (OSS-safe defaults)
+
+Add to `conf/snapshot.conf.example` (all optional):
+
+```bash
+# Rate limit — forced-command backup modes (probe exempt)
+SNAP_RATE_BURST_COUNT=3
+SNAP_RATE_BURST_WINDOW_SEC=600
+SNAP_RATE_SUSTAIN_COUNT=5
+SNAP_RATE_SUSTAIN_WINDOW_SEC=3600
+```
+
+Archive: env vars in LaunchAgent (or constants at top of `mirror.sh` with comment — mirror limits less sensitive to mis-tuning than prune ages):
+
+```bash
+SNAP_RATE_MIRROR_BURST_COUNT=4
+SNAP_RATE_MIRROR_BURST_WINDOW_SEC=300
+SNAP_RATE_VERIFY_COUNT=2
+SNAP_RATE_VERIFY_WINDOW_SEC=86400
+```
+
+**Do not** tie defaults to “4×/day” numerically — the 10-minute burst window is justified from human testing behavior; the 5-minute archive mirror burst allows 5-minute polling generically.
+
+---
+
+## 9. Testing Plan (for implementers)
+
+### Source (`bin/snapshot-dispatch` + selftest additions)
+
+1. 3× `snap` within 5 min → all exit 0 (mock snapshot to instant exit).
+2. 4th within 10 min → exit **78**, stderr contains `denied — rate limit`, dispatch.log `DENIED`.
+3. `probe` × 10 → never 78.
+4. While snapshot lock held → exit **79**, history count unchanged.
+5. After oldest entry ages out of window → allowed again.
+6. `exit 77` unchanged for `evil` mode.
+
+### Archive (`mirror.sh` + engine selftest hook)
+
+1. Forced `deep-verify` × 2 in 1 h → OK; 3rd → 78.
+2. Forced `mirror` × 4 in 5 min → OK; 5th → 78.
+3. `AGENT_SNAPSHOT_KICK=1 mirror` × 20 → always OK.
+4. Deny → `last-rate-limit.json` written; next engine health pass → **P16**.
+5. Writer kick + forced mirror within 30 s → OK.
+
+---
+
+## 10. Known Limitations
+
+1. **Key-only threat model, not full host compromise.** Local uid can delete state files or run `bin/snapshot` directly.
+2. **Slow abuse near disk floor** still deletes some history, just bounded per hour.
+3. **Source has no monitor** in v1 — denial visibility is log + `last-rate-limit.json` only.
+4. **`probe` unlimited** — intentional; could be abused for CPU/network on probe’s rsync dry-run; lower risk than snap path.
+5. **Archive mirror steady poll** consumes history entries — by design; only *burst above* poll+kick margin is denied.
+6. **P16 persists 24 h** after one denial — may alarm after attack stops; acceptable for security signaling.
+7. **REPLICA_KICK contract change** requires operators upgrading conf to add `AGENT_SNAPSHOT_KICK=1`; without it, writer kicks count toward mirror burst (usually still OK at 1 kick per snap + 5-min poll; flag in upgrade notes).
+
+---
+
+## 11. Implementation Checklist (tomorrow)
+
+1. Add `state/` dir creation to `snapshot-install` (mode 700).
+2. Implement rate-limit bash functions; wire into `snapshot-dispatch` before `exec`.
+3. Add conf vars + `AGENT_SNAPSHOT_KICK=1` to `REPLICA_KICK` in install template and example conf.
+4. Implement parallel logic in `mirror.sh` with forced-path detection + kick exemption.
+5. Add `last-rate-limit.json` writer on deny (both sides).
+6. Add **P16** + `rate_limited` event kind in `engine.py` `compute_health()`.
+7. Document exit **78/79** in `docs/SAFETY.md` and `archive-host/README.md`.
+8. Extend selftests per §9.
+
+---
+
+**Summary judgment:** **`snapshot-dispatch` is the correct source chokepoint; `mirror.sh` needs its own independent gate** with different thresholds (mirror burst vs deep-verify daily) and an explicit **writer-kick exemption** via `AGENT_SNAPSHOT_KICK=1`. Default **3 per 10 min + 5 per hour** on source balances “run twice while testing” against prune-to-fit abuse; archive **4 per 5 min (mirror)** and **2 per 24 h (deep-verify)** respect 5-minute polling and daily verify schedules without hardcoding any one operator’s calendar.

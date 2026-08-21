@@ -48,8 +48,43 @@ EXCLUDES=(
   ".Trashes"
 )
 
+# --- Rate limiting (source forced-command dispatcher) ------------------------
+# A holder of the writer forced-command key cannot delete history directly, but
+# repeatedly triggering snap/both while free space sits below SNAP_MIN_FREE_GB
+# forces prune_snap_to_fit() to drop the oldest snapshot once per completed run —
+# an indirect but real retention bypass. snapshot-dispatch enforces these caps
+# before bin/snapshot starts. probe is deliberately exempt (read-only, no prune
+# path). The values are chosen so a human running a backup twice while testing
+# is never denied; scheduled cadence is far looser than either window.
+SNAP_RATE_BURST_COUNT=3              # max snap|vault|both triggers in the burst window
+SNAP_RATE_BURST_WINDOW_SEC=600       # burst window (10 min)
+SNAP_RATE_SUSTAIN_COUNT=2            # max snap|vault|both triggers in the sustain window
+SNAP_RATE_SUSTAIN_WINDOW_SEC=3600    # sustain window (60 min)
+
+# --- Key rotation (writer forced-command key) --------------------------------
+# The dispatch key is generated once at install and would otherwise never expire.
+# Scheduled rotation bounds leak exposure; the overlap window keeps the previous
+# key valid while clients and authorized_keys catch up. Registry state and the
+# stable symlink live under ~/.ssh/agent-snapshot/ (managed by snapshot-key-rotate).
+KEY_ROTATION_ENABLED=true            # weekly rotate-if-due launchd job (when installed)
+KEY_ROTATION_DAYS=90                 # rotate when the active key is older than this
+KEY_OVERLAP_HOURS=72                 # previous key stays valid this long after rotation
+# When true, the rotation job edits ~/.ssh/authorized_keys unattended — without
+# this, keys age and print-only output rots on the operator's desk instead of
+# rotating. Safety rails: timestamped backup before every edit, append-then-verify
+# before flipping the stable symlink, probe-gated cutover with rollback on failure,
+# and finalize removes only our exact-comment lines — never anyone else's forced-
+# command entries. The one-time install authorized_keys line remains a manual human
+# gate by design; only recurring rotation is automated.
+KEY_ROTATION_APPLY_AK=true
+
 # Optional: command run ON THE ARCHIVE HOST after a successful snapshot to start
 # its replica pass (primary DAS -> mirror DAS) immediately instead of waiting
 # for the archive host's own 5-minute poll. Empty string disables the kick.
 # Contract: the entrypoint runs correctly with NO arguments (defaults to mirror).
-REPLICA_KICK='nohup "$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'
+# AGENT_SNAPSHOT_KICK=1 tells mirror.sh this is the legitimate writer kick, not a
+# forced-command SSH trigger — the archive rate limiter exempts it and writes no
+# history entry. Upgrading deployments must update this line when mirror.sh gains
+# the rate gate; without the flag, post-snapshot kicks count as forced mirror
+# traffic and can be denied during testing bursts.
+REPLICA_KICK='AGENT_SNAPSHOT_KICK=1 nohup "$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'

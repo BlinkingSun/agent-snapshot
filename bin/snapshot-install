@@ -4,18 +4,22 @@
 #   snapshot-install --source DIR --snap-ssh TARGET --snap-dir PATH --snap-time HH:MM \
 #                    [--snap-retention N] [--snap-min-free-gb N] \
 #                    [--vault-ssh T --vault-os posix|windows --vault-dir P --vault-time HH:MM --vault-retention N] \
-#                    [--no-schedule]
+#                    [--no-schedule] [--no-key-rotation]
 #
 # What it does:
 #   1. Copies bin/ and conf/ into ~/Library/Application Support/agent-snapshot/
+#      (including snapshot-key-lib.sh, snapshot-key-rotate); creates state/ (0700)
 #   2. Writes conf/snapshot.conf from your flags
 #   3. Creates a DEDICATED ssh key (~/.ssh/id_ed25519_agent_snapshot) if missing
-#   4. PRINTS the forced-command authorized_keys line for you (or your agent)
+#   4. Bootstraps the key registry (snapshot-key-rotate bootstrap --role writer)
+#   5. PRINTS the forced-command authorized_keys line for you (or your agent)
 #      to append — this script never edits authorized_keys itself: your ssh
 #      access may be load-bearing, and a bad edit can lock you out or break
-#      other forced-command jobs. Append it yourself, deliberately.
-#   5. Renders + loads the launchd schedule(s)
-#   6. Tells you how to verify (probe) before trusting anything
+#      other forced-command jobs. Append it yourself, deliberately. (Recurring
+#      rotation with KEY_ROTATION_APPLY_AK=true edits authorized_keys on schedule;
+#      only this one-time install line stays a manual human gate.)
+#   6. Renders + loads the launchd schedule(s) and optional key-rotation job
+#   7. Tells you how to verify (probe, registry status) before trusting anything
 #
 # Single-machine mode: pass --snap-ssh localhost and attach both DAS drives to
 # this machine. The same forced-command transport applies.
@@ -29,7 +33,7 @@ KEY="$HOME/.ssh/id_ed25519_agent_snapshot"
 SRC="" SNAP_SSH="" SNAP_DIR="" SNAP_TIME=""
 SNAP_RET=90 SNAP_FLOOR=50
 VAULT_SSH="" VAULT_OS="posix" VAULT_DIR="" VAULT_TIME="" VAULT_RET=5
-SCHEDULE=1
+SCHEDULE=1 KEY_ROTATION=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +49,8 @@ while [ $# -gt 0 ]; do
     --vault-time) VAULT_TIME="$2"; shift 2 ;;
     --vault-retention) VAULT_RET="$2"; shift 2 ;;
     --no-schedule) SCHEDULE=0; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --no-key-rotation) KEY_ROTATION=0; shift ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -56,8 +61,17 @@ done
 
 echo "== 1/5 installing to $APPDIR"
 mkdir -p "$APPDIR/bin" "$APPDIR/conf"
-cp "$REPO/bin/snapshot" "$REPO/bin/snapshot-dispatch" "$APPDIR/bin/"
-chmod +x "$APPDIR/bin/snapshot" "$APPDIR/bin/snapshot-dispatch"
+{
+  old_umask=$(umask)
+  umask 077
+  mkdir -p "$APPDIR/state"
+  umask "$old_umask"
+}
+cp "$REPO/bin/snapshot" "$REPO/bin/snapshot-dispatch" \
+   "$REPO/bin/snapshot-key-lib.sh" "$REPO/bin/snapshot-key-rotate" "$APPDIR/bin/"
+chmod +x "$APPDIR/bin/snapshot" "$APPDIR/bin/snapshot-dispatch" \
+         "$APPDIR/bin/snapshot-key-rotate"
+chmod 0644 "$APPDIR/bin/snapshot-key-lib.sh"
 
 echo "== 2/5 writing conf/snapshot.conf"
 VE=false; [ -n "$VAULT_SSH" ] && VE=true
@@ -94,25 +108,47 @@ EXCLUDES=(
   ".Trashes"
 )
 
-REPLICA_KICK='nohup "\$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'
+SNAP_RATE_BURST_COUNT=3
+SNAP_RATE_BURST_WINDOW_SEC=600
+SNAP_RATE_SUSTAIN_COUNT=2
+SNAP_RATE_SUSTAIN_WINDOW_SEC=3600
+
+KEY_ROTATION_ENABLED=true
+KEY_ROTATION_DAYS=90
+KEY_OVERLAP_HOURS=72
+KEY_ROTATION_APPLY_AK=true
+
+REPLICA_KICK='AGENT_SNAPSHOT_KICK=1 nohup "\$HOME/Library/AgentSnapshot/mirror.sh" >/dev/null 2>&1 &'
 EOF
 
-echo "== 3/5 dedicated ssh key"
+echo "== 3/5 dedicated ssh key + registry bootstrap"
 if [ ! -f "$KEY" ]; then
   ssh-keygen -t ed25519 -N "" -C "agent-snapshot" -f "$KEY" >/dev/null
   echo "   created $KEY"
 else
   echo "   exists  $KEY"
 fi
+"$APPDIR/bin/snapshot-key-rotate" bootstrap --role writer
+
+# shellcheck source=/dev/null
+source "$APPDIR/bin/snapshot-key-lib.sh"
+AK_COMMENT="agent-snapshot:$(
+  /usr/bin/python3 - "$HOME/.ssh/agent-snapshot/state.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    print(json.load(fh)["active"])
+PY
+)"
 
 echo
 echo "== 4/5 ACTION REQUIRED — append this ONE line to ~/.ssh/authorized_keys"
 echo "   (append, never replace the file; other entries may be load-bearing):"
 echo
-printf 'restrict,command="/bin/bash '\''%s/bin/snapshot-dispatch'\''" %s\n' \
-  "$APPDIR" "$(cat "$KEY.pub")"
+asnap_ak_line "$APPDIR/bin/snapshot-dispatch" "$KEY.pub" "$AK_COMMENT"
 echo
 echo "   This script will NOT edit authorized_keys for you, by design."
+echo "   Recurring rotation (KEY_ROTATION_APPLY_AK=true) updates authorized_keys"
+echo "   on schedule; only this one-time install line remains a manual human gate."
 
 if [ "$SCHEDULE" = 1 ]; then
   echo "== 5/5 launchd schedule(s)"
@@ -127,23 +163,42 @@ if [ "$SCHEDULE" = 1 ]; then
     launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
     echo "   $leg -> daily $hm ($plist)"
   }
+  render_key_rotate_plist() {
+    local plist="$HOME/Library/LaunchAgents/com.agent-snapshot.key-rotate.plist"
+    sed -e "s|__HOME__|$HOME|g" -e "s|__APPDIR__|$APPDIR|g" \
+        "$REPO/launchd/com.agent-snapshot.key-rotate.plist.template" > "$plist"
+    launchctl bootout "gui/$(id -u)/com.agent-snapshot.key-rotate" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+    echo "   key-rotate -> weekly Sun 05:45 ($plist)"
+  }
   [ -n "$SNAP_TIME" ]  && render_plist snap  snap  "$SNAP_TIME"
   [ -n "$VAULT_TIME" ] && render_plist vault vault "$VAULT_TIME"
-  [ -z "$SNAP_TIME$VAULT_TIME" ] && echo "   (no --snap-time/--vault-time given — nothing scheduled)"
+  [ "$KEY_ROTATION" = 1 ] && render_key_rotate_plist
+  [ -z "$SNAP_TIME$VAULT_TIME" ] && [ "$KEY_ROTATION" = 0 ] && \
+    echo "   (no --snap-time/--vault-time and --no-key-rotation — nothing scheduled)"
+elif [ "$KEY_ROTATION" = 1 ]; then
+  echo "== 5/5 scheduling skipped (--no-schedule; key-rotation launchd not loaded)"
 else
   echo "== 5/5 scheduling skipped (--no-schedule)"
 fi
 
-cat <<'EOF'
+cat <<EOF
 
 == NEXT: verify before you trust it ==
  1. Grant sshd Full Disk Access (once):
       System Settings > Privacy & Security > Full Disk Access > enable sshd/Remote Login
     and enable Remote Login in System Settings > Sharing.
- 2. Probe (read-only, proves the whole transport + source access):
+ 2. Key registry (bootstrap should already have run):
+      "$APPDIR/bin/snapshot-key-rotate" status --role writer
+    Expect: active key id matches the comment on the authorized_keys line above.
+ 3. Key rotation job (when scheduled at install):
+      launchctl print "gui/\$(id -u)/com.agent-snapshot.key-rotate"
+    Expect: state = not running or waiting; path points at snapshot-key-rotate rotate-if-due.
+    (Skipped when you passed --no-schedule or --no-key-rotation.)
+ 4. Probe (read-only, proves the whole transport + source access):
       ssh -i ~/.ssh/id_ed25519_agent_snapshot -o IdentitiesOnly=yes localhost probe
     Expect: every T* = OK and "probe: OVERALL rc=0".
- 3. First snapshot, on demand:
+ 5. First snapshot, on demand:
       ssh -i ~/.ssh/id_ed25519_agent_snapshot -o IdentitiesOnly=yes localhost snap
     Then confirm the dated directory exists on the archive host's DAS.
 EOF
