@@ -9,9 +9,11 @@
 # Source this file; it defines functions only (no side effects at source time).
 
 # ---------- paths ----------
+# Overridable via ASNAP_APPDIR / ASNAP_REGISTRY_DIR so one library deploys to multiple
+# installations (e.g. two separately installed copies) without forking validated code.
 
 asnap_appdir() {
-  printf '%s\n' "$HOME/Library/Application Support/agent-snapshot"
+  printf '%s\n' "${ASNAP_APPDIR:-$HOME/Library/Application Support/agent-snapshot}"
 }
 
 asnap_state_dir() {
@@ -27,7 +29,7 @@ asnap_state_dir() {
 }
 
 asnap_registry_dir() {
-  printf '%s\n' "$HOME/.ssh/agent-snapshot"
+  printf '%s\n' "${ASNAP_REGISTRY_DIR:-$HOME/.ssh/agent-snapshot}"
 }
 
 asnap_mtime() {
