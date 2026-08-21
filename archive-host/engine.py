@@ -32,6 +32,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -59,12 +60,29 @@ RSYNC = "/usr/bin/rsync"
 # 00 F8.5 / 01 C2: ONE shared constant.  Used by the rsync invocation, the step-5 verify walk,
 # the step-5b inode audit walks and the F9 deep-verify walk.  A bare name matches AT ANY DEPTH
 # (01 E8), so the walk filter tests every path component, not just the tree root.
-EXCLUDES = (".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems")
+# ONE shared constant: used by the rsync argv, the verify walk, the inode audit AND
+# deep-verify. If these ever diverge, a path rsync was told to skip still gets counted by
+# verification and the snapshot fails forever (00 F8 C2).
+#
+# .DS_Store added 2026-08-21 after a REAL production false alarm. Finder writes .DS_Store
+# into any directory it browses, including snapshot dirs on the mounted DAS. Snapshots are
+# immutable once promoted, so the mirror's copy never gains them -- the primary drifts and
+# deep-verify reports a listing mismatch, healthy=false, monitor RED, on an archive with
+# ZERO missing data (every differing path was .DS_Store; nothing was absent from the
+# mirror). The writer already excludes .DS_Store, so these never originate from the backup
+# source and excluding them here loses nothing real. A monitor that goes red because
+# someone opened a Finder window is a monitor people learn to ignore.
+EXCLUDES = (".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".DS_Store")
 
 # 00 F8.3 / 02 hard constraints.  Prefix match: "--del" also catches --delete-before/--delete-excluded
 # /--del, "--force" also catches --force-delete.
 FORBIDDEN_FLAG_PREFIXES = ("--inplace", "--del", "--remove-source-files", "--force")
 
+VERIFY_SWEEP_DAYS = 90        # every promoted snapshot must be content-verified at least once
+                              # within this many days -- keep it <= the writer's retention, or
+                              # snapshots age out unverified.  See deep_verify().
+VERIFY_MAX_OLDER_PER_PASS = 8 # cost ceiling: each older target is a full two-sided walk plus
+                              # sampled hashing (~2-3 min on a 150k-file snapshot over USB).
 PRUNE_AGE_DAYS = 100          # writer retention (default 90d) + margin. Keep ABOVE the writer's SNAP_RETENTION.
 MAX_PRUNES_PER_PASS = 2       # 00 F8: a mass rm -rf is never one bug away.
 MIN_FREE_GB_DEFAULT = 50      # 00 F5 P8 / HANDOFF 4.8
@@ -1672,8 +1690,38 @@ class Engine(object):
         targets = [promoted[-1]]
         older = promoted[:-1]
         if older:
+            # COVERAGE-DRIVEN ROTATION.  Verifying ONE older snapshot per day is only
+            # adequate while the archive holds about as many snapshots as the retention
+            # window has days.  When the writer's cadence rises, a fixed count silently
+            # guts the safety net:
+            #
+            #   1 backup/day  -> 90 snapshots, full sweep 90d  == 90d lifetime -> 100% ever verified
+            #   4 backups/day -> 360 snapshots, full sweep 360d >> 90d lifetime ->  25% ever verified
+            #
+            # i.e. three quarters of snapshots would be pruned having NEVER had their
+            # content checked, and sampled content hashing is the only thing that detects
+            # bit rot or a mirror copy that was already wrong.  So scale the rotation to
+            # finish a full sweep within the retention window instead of fixing it at one.
+            per_pass = max(1, int(math.ceil(len(older) / float(VERIFY_SWEEP_DAYS))))
+            want = per_pass
+            per_pass = min(per_pass, VERIFY_MAX_OLDER_PER_PASS, len(older))
+            if want > VERIFY_MAX_OLDER_PER_PASS:
+                # The cost ceiling is binding, so a full sweep will take longer than
+                # VERIFY_SWEEP_DAYS and some snapshots WILL age out unverified. Say so:
+                # a safety net that quietly shrinks is worse than one that reports it.
+                self.note("deep-verify coverage degraded: %d older snapshot(s) would need "
+                          "checking per pass to sweep all %d within %d days, but the cost "
+                          "ceiling allows %d -- full sweep now ~%.0f days, so some snapshots "
+                          "may be pruned unverified. Raise VERIFY_MAX_OLDER_PER_PASS or "
+                          "shorten retention."
+                          % (want, len(older), VERIFY_SWEEP_DAYS, VERIFY_MAX_OLDER_PER_PASS,
+                             len(older) / float(VERIFY_MAX_OLDER_PER_PASS)))
             doy = datetime.date.today().timetuple().tm_yday
-            targets.append(older[doy % len(older)])
+            start = (doy * per_pass) % len(older)
+            for k in range(per_pass):
+                cand = older[(start + k) % len(older)]
+                if cand not in targets:
+                    targets.append(cand)
         details = []
         ok = True
         for s in targets:

@@ -90,8 +90,28 @@ single fault or clock error can mass-delete the mirror.
 ## (c) What deep-verify checks, and when
 
 `deep-verify` is a separate mode, scheduled daily (03:15 in the reference deployment).
-Per run it targets the newest promoted snapshot plus one rotating older snapshot
-(index = day-of-year mod count), and performs:
+Per run it always targets the newest promoted snapshot, plus a **coverage-driven
+rotation** of older ones: enough are selected each pass (`ceil(older / VERIFY_SWEEP_DAYS)`,
+capped at `VERIFY_MAX_OLDER_PER_PASS`) that every promoted snapshot is content-checked at
+least once within `VERIFY_SWEEP_DAYS`. This matters because coverage is a function of
+backup **cadence**, not just retention: at 1 backup/day, 90 days of retention is 90
+snapshots and a fixed one-per-pass rotation happens to sweep all of them every 90 days. At
+4 backups/day, that same fixed rotation would need 360 days to reach every snapshot once —
+three quarters of them would age out and be pruned **having never been content-verified at
+all**. If the cost ceiling ever binds tightly enough that a full sweep would exceed
+`VERIFY_SWEEP_DAYS`, the engine says so explicitly (an advisory note) rather than silently
+verifying less than it claims to.
+
+**Cost, so this doesn't surprise anyone deploying at higher cadence:** each older target is
+a full two-sided listing walk plus sampled content hashing — roughly 2-3 minutes per
+~150k-file snapshot over USB in the reference deployment. At the reference cadence (1
+backup/day -> ~90 snapshots), a nightly pass is cheap. At 4 backups/day -> ~360 snapshots,
+the ceiling (`VERIFY_MAX_OLDER_PER_PASS = 8`) makes a nightly pass take on the order of
+30-70 minutes. Still fine for a once-daily job with nothing else contending, but no longer
+negligible — budget for it, and raise `VERIFY_MAX_OLDER_PER_PASS` only with that cost in
+mind.
+
+Each targeted snapshot performs:
 
 - a full listing comparison against the primary — file count, total bytes, and an md5 of
   the sorted `relpath\tsize` listing; and

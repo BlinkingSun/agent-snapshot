@@ -36,6 +36,20 @@ above the writer's `SNAP_RETENTION` plus margin** (defaults: 100 vs 90). If you
 raise the writer's retention, raise this with it — the mirror must always
 outlive the primary, or the P9 "possible primary data loss" window collapses.
 
+**`VERIFY_SWEEP_DAYS` (90) and `VERIFY_MAX_OLDER_PER_PASS` (8) couple deep-verify
+coverage to backup *cadence*, not just retention.** Coverage is "every promoted
+snapshot content-checked at least once within `VERIFY_SWEEP_DAYS`" — at 1
+backup/day that's ~90 snapshots and a cheap nightly rotation; at 4 backups/day
+it's ~360 snapshots, and without this scaling, three quarters of them would be
+pruned having never been content-verified at all. **Raising backup frequency
+therefore raises deep-verify's per-pass cost**, not just its target count: each
+older target is a full two-sided walk plus sampled hashing (~2-3 min per
+~150k-file snapshot over USB in the reference deployment), so a nightly pass
+at the default ceiling can run 30-70 minutes at 4×/day cadence versus a couple
+minutes at 1×/day. Budget the schedule accordingly; the engine logs an
+explicit advisory if the cost ceiling ever forces coverage below the sweep
+target rather than silently verifying less than it claims.
+
 ## Install
 
 ```sh

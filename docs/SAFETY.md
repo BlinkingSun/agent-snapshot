@@ -75,9 +75,16 @@ trustworthy):
   write access to the mirror volume can delete from it directly. The engine
   defends against *primary-side* loss propagating — keep the archive host
   itself boring and agent-free.
-- **Corruption is detected, not auto-repaired.** A damaged file in a primary
-  snapshot never overwrites the mirror's good copy; deep-verify raises P5 and
-  a human decides the repair direction.
+- **Corruption is detected, not auto-repaired — deliberately, not a missing
+  feature.** A damaged file in a primary snapshot never overwrites the
+  mirror's good copy; deep-verify raises P5 and a human decides the repair
+  direction. This restraint is what makes the mirror trustworthy as a
+  reference copy: an engine that "fixed" every mismatch by re-syncing would,
+  on a genuinely damaged or contaminated primary, propagate that damage onto
+  the mirror and destroy the one good copy that made diagnosis possible in
+  the first place. Proven in practice: a false-positive P5 (Finder writing
+  `.DS_Store` into a promoted snapshot) was diagnosed in hours specifically
+  *because* the mirror had been left untouched to compare against.
 
 ## 4. Verified at every hop
 
