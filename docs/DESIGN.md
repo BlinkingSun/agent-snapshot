@@ -64,6 +64,36 @@ Trust nothing you didn't check this run:
   time: source readability (the three TCC gates), tool availability, target
   reachability.
 
+## Failure must be loud
+
+A run that did nothing must never read as a run that worked:
+
+- **Per-leg locks, loud bounces.** Each leg locks its own stage subdir, so a
+  long vault archive can't swallow the next snap slot. A run that finds its
+  leg already running exits **75**; the dispatcher's busy answer is **79**.
+  Either one in `launchctl list` means "slot skipped, backup NOT taken".
+- **Promotion is part of success.** Moving `latest` to the new snapshot is
+  retried three times and verified by reading the link back. If it still
+  fails, the run fails: a finished rsync whose snapshot never became `latest`
+  is flagged by the archive engine as a corpse, and the writer must agree.
+- **Pick the host once.** `SNAP_SSH` (optionally `SNAP_SSH_FALLBACK`) is
+  resolved at run start and reused for every later step, so a name-resolution
+  dropout mid-run can't strand the finalize after an hour of rsync.
+
+## Change sidecar (opt-in writer hook)
+
+With `SNAP_CHANGE_SIDECAR=true`, after a successful snap run with a link-dest
+base the writer publishes `SNAP_DIR/.changes/<stamp>.json`: the files and
+symlinks rsync re-copied against the base (from GNU rsync's itemized output),
+plus the snapshot's regular-file count and logical bytes measured on the
+archive host. It is a hook for a future archive-side fast replica path. The
+bundled engine **does not consume it** and always does a full pass
+(`archive-host/SEMANTICS.md` (g)). It is advisory: openrsync (macOS
+`/usr/bin/rsync`), a baseline run, or any publishing error simply means no
+sidecar. The writer owns `.changes/` and prunes sidecars whose snapshot is
+gone (unconditionally, so turning the option off leaves nothing behind); the
+engine never deletes primary content.
+
 ## Single-machine mode
 
 Set `SNAP_SSH="localhost"` and attach both drives locally. The forced-command

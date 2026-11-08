@@ -232,9 +232,10 @@ arch_deny() {
   printf '%s/last-rate-limit.json\n' "$SNAP_STATE_DIR"
 }
 
-hold_source_busy() {
-  local stage="$HOME/Library/Caches/agent-snapshot"
-  mkdir -p "$stage/.lock"
+# bin/snapshot locks per leg: a live run advertises $STAGE/<leg>/.pid.
+hold_source_busy() {  # [leg=snap]
+  local stage="$HOME/Library/Caches/agent-snapshot/${1:-snap}"
+  mkdir -p "$stage"
   ( sleep 300 ) &
   BUSY_PID=$!
   printf '%s\n' "$BUSY_PID" > "$stage/.pid"
@@ -242,7 +243,7 @@ hold_source_busy() {
 
 release_source_busy() {
   [ -n "${BUSY_PID:-}" ] && kill "$BUSY_PID" 2>/dev/null && wait "$BUSY_PID" 2>/dev/null || true
-  rm -f "$HOME/Library/Caches/agent-snapshot/.pid"
+  rm -f "$HOME/Library/Caches/agent-snapshot/snap/.pid" "$HOME/Library/Caches/agent-snapshot/vault/.pid"
   unset BUSY_PID
 }
 
@@ -372,6 +373,27 @@ release_source_busy
 aeq "busy rc" 79 "$RC"
 aeq "history count unchanged under busy" "$BEFORE" "$(history_count "$HIST")"
 anot "busy did not write deny artifact" "yes" "$([ -f "$(src_deny)" ] && echo yes || echo no)"
+
+########################################################################################
+head_ "S06b per-leg locks: busy vault leg bounces vault+both, never snap"
+newroot s06b
+HIST="$(src_history)"
+hold_source_busy vault
+BEFORE="$(history_count "$HIST")"
+SSH_ORIGINAL_COMMAND=vault src_dispatch
+aeq "vault busy: vault rc" 79 "$RC"
+SSH_ORIGINAL_COMMAND=both src_dispatch
+aeq "vault busy: both rc" 79 "$RC"
+aeq "vault busy: history unchanged by vault+both" "$BEFORE" "$(history_count "$HIST")"
+SSH_ORIGINAL_COMMAND=snap src_dispatch
+aeq "vault busy: snap leg still admitted" 0 "$RC"
+release_source_busy
+hold_source_busy snap
+SSH_ORIGINAL_COMMAND=vault src_dispatch
+aeq "snap busy: vault leg still admitted" 0 "$RC"
+SSH_ORIGINAL_COMMAND=both src_dispatch
+aeq "snap busy: both rc" 79 "$RC"
+release_source_busy
 
 ########################################################################################
 head_ "S07 source window expiry: aged entries no longer count"

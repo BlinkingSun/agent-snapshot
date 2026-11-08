@@ -340,8 +340,9 @@ That is acceptable only because of non-negotiable safety rails:
    `agent-snapshot-replica:` comments only. Other forced-command jobs on the
    same machine are load-bearing and must never be touched.
 7. **Refuse to rotate mid-run** — rotation checks the same busy lock as dispatch
-   (`STAGE/.lock` flock on the writer; replica `mirror.pid` flock). If a snapshot
-   or mirror pass is active, rotation defers (exit 79).
+   (the writer's per-leg PID locks `STAGE/snap/.pid` and `STAGE/vault/.pid` —
+   either leg running counts; replica `mirror.pid` flock). If a snapshot, vault
+   archive or mirror pass is active, rotation defers (exit 79).
 
 Set `KEY_ROTATION_APPLY_AK=false` if you want print-only rotation (the tool
 prints the line; symlink does not flip until the line is actually present). That
@@ -916,8 +917,8 @@ wc -l ~/.ssh/authorized_keys
 
 ### 7. Rotation ran during your maintenance window
 
-Rotation **defers** when the dispatch busy lock is held (writer `STAGE/.lock`,
-replica mirror flock). If you were restoring **files from backup history** (not
+Rotation **defers** when the dispatch busy lock is held (writer per-leg locks
+`STAGE/snap/.pid` / `STAGE/vault/.pid`, replica mirror flock). If you were restoring **files from backup history** (not
 running snapshot), that does not hold the lock — rotation may still run.
 
 If rotation changed `authorized_keys` or the symlink during maintenance:

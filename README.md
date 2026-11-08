@@ -117,6 +117,10 @@ Everything lives in `conf/snapshot.conf` — no site details in code:
 | `SOURCE` | the directory to protect (any directory) |
 | `--snap-time` / `--vault-time` (installer) or the plists | **backup frequency** — daily at your chosen times; edit `StartCalendarInterval` for other cadences |
 | `SNAP_RETENTION` / `VAULT_RETENTION` | days of history kept per leg |
+| `VAULT_KEEP` | keep the newest N vault archives instead of an age window |
+| `SNAP_SSH_FALLBACK` | second address for the archive host, picked once per run |
+| `VAULT_MIN_FREE_GB` | free space the vault drive must keep after an upload |
+| `SNAP_CHANGE_SIDECAR` | opt-in per-run change manifest (not read by the bundled engine) |
 | `SNAP_MIN_FREE_GB` | free-space floor on the DAS before abort/prune |
 | `EXCLUDES` | build output & OS noise excluded from every run |
 | `SNAP_RATE_*` | caps on how often `snap\|vault\|both` can be triggered through the forced-command dispatcher |

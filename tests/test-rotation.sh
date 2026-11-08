@@ -324,8 +324,9 @@ append_active_ak_line() {
   asnap_ak_append "$HOME/.ssh/authorized_keys" "$line"
 }
 
-hold_busy_lock() {
-  local stage="$HOME/Library/Caches/agent-snapshot"
+# bin/snapshot locks per leg: a live run advertises $STAGE/<leg>/.pid.
+hold_busy_lock() {  # [leg=snap]
+  local stage="$HOME/Library/Caches/agent-snapshot/${1:-snap}"
   mkdir -p "$stage"
   # Hold a subshell alive so kill -0 succeeds on the recorded pid.
   ( sleep 300 ) &
@@ -335,7 +336,7 @@ hold_busy_lock() {
 
 release_busy_lock() {
   [ -n "${BUSY_PID:-}" ] && kill "$BUSY_PID" 2>/dev/null && wait "$BUSY_PID" 2>/dev/null || true
-  rm -f "$HOME/Library/Caches/agent-snapshot/.pid"
+  rm -f "$HOME/Library/Caches/agent-snapshot/snap/.pid" "$HOME/Library/Caches/agent-snapshot/vault/.pid"
   unset BUSY_PID
 }
 
@@ -571,6 +572,12 @@ aeq "busy rotate rc" 79 "$RC"
 ahas "busy message" "run in progress" "$(cat "$ROOT/err.txt")"
 aeq "active key unchanged under busy" "$ACTIVE" "$(state_field active)"
 assert_unrelated_unchanged "T06 after busy refusal"
+hold_busy_lock vault
+kr rotate --apply-authorized-keys
+release_busy_lock
+aeq "vault-leg busy rotate rc" 79 "$RC"
+ahas "vault-leg busy message names the vault lock" "vault/.lock" "$(cat "$ROOT/err.txt")"
+aeq "active key unchanged under vault-leg busy" "$ACTIVE" "$(state_field active)"
 
 ########################################################################################
 head_ "T07 backups: every AK edit leaves timestamped .bak- with pre-edit content"

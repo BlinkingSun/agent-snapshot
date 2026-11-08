@@ -43,6 +43,8 @@ COMMENT_PREFIX=""
 FORCED_CMD=""
 APPDIR=""
 BUSY_LOCK=""
+BUSY_LOCK_ALT=""
+BUSY_LOCK_HELD=""
 ROT_LOCK=""
 ROTATION_DAYS=90
 _kr_rotation_lock_held=0
@@ -127,7 +129,9 @@ _kr_load_writer_conf() {
   else
     CONF_APPLY_AK=0
   fi
-  BUSY_LOCK="${STAGE:-$HOME/Library/Caches/agent-snapshot}/.lock"
+  # Per-leg writer locks ($STAGE/snap, $STAGE/vault): either leg running defers.
+  BUSY_LOCK="${STAGE:-$HOME/Library/Caches/agent-snapshot}/snap/.lock"
+  BUSY_LOCK_ALT="${STAGE:-$HOME/Library/Caches/agent-snapshot}/vault/.lock"
   FORCED_CMD="$APPDIR/bin/snapshot-dispatch"
 }
 
@@ -140,6 +144,7 @@ _kr_load_replica_conf() {
     CONF_APPLY_AK=0
   fi
   BUSY_LOCK="$HOME/Library/AgentSnapshot/mirror.pid"
+  BUSY_LOCK_ALT=""
   FORCED_CMD="$HOME/Library/AgentSnapshot/mirror.sh"
 }
 
@@ -365,7 +370,11 @@ _kr_is_busy() {
   if [ "$FORCE" -eq 1 ]; then
     return 1
   fi
-  _asnap_is_busy "$BUSY_LOCK"
+  BUSY_LOCK_HELD="$BUSY_LOCK"
+  _asnap_is_busy "$BUSY_LOCK" && return 0
+  [ -n "$BUSY_LOCK_ALT" ] || return 1
+  BUSY_LOCK_HELD="$BUSY_LOCK_ALT"
+  _asnap_is_busy "$BUSY_LOCK_ALT"
 }
 
 _kr_symlink_key_id() {
@@ -948,8 +957,8 @@ _kr_do_rotate() {
   fi
 
   if _kr_is_busy "$BUSY_LOCK"; then
-    _kr_log "rotate: deferred — busy lock held ($BUSY_LOCK)"
-    echo "snapshot-key-rotate: snapshot/engine run in progress (lock $BUSY_LOCK); retry later" >&2
+    _kr_log "rotate: deferred — busy lock held ($BUSY_LOCK_HELD)"
+    echo "snapshot-key-rotate: snapshot/engine run in progress (lock $BUSY_LOCK_HELD); retry later" >&2
     exit 79
   fi
 

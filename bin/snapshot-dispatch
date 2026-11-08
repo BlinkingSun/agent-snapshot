@@ -123,7 +123,19 @@ case "$MODE" in
     HISTORY="$STATE_DIR/trigger-history.json"
     HISTORY_LOCK="$STATE_DIR/trigger-history.lockdir"
     DENY_JSON="$STATE_DIR/last-rate-limit.json"
-    BUSY_LOCK="$STAGE/.lock"
+    # Per-leg lock: bin/snapshot locks $STAGE/<leg>/ (PID file), so the busy
+    # probe looks there too. `both` holds both legs; admission keys on the snap
+    # lock and the vault lock is checked first so a busy vault leg also
+    # bounces 79 without consuming a quota slot.
+    case "$MODE" in
+      both) BUSY_LOCK="$STAGE/snap/.lock"
+            if _asnap_is_busy "$STAGE/vault/.lock"; then
+              log "BUSY mode=$MODE client=[${SSH_CLIENT:-none}] lock=$STAGE/vault/.lock"
+              echo "snapshot-dispatch: snapshot already running (lock $STAGE/vault/.lock); try again later" >&2
+              exit 79
+            fi ;;
+      *)    BUSY_LOCK="$STAGE/$MODE/.lock" ;;
+    esac
 
     asnap_admit "$HISTORY" "$HISTORY_LOCK" "$BUSY_LOCK" "source-forced" "$MODE" \
       "${SSH_CLIENT:-}" \
@@ -186,6 +198,8 @@ case "$MODE" in
     if [ "${SNAP_ENABLED:-false}" = true ]; then
       if ssh $SSH_OPTS "$SNAP_SSH" 'exit 0' >/dev/null 2>&1; then
         echo "probe: T4 archive host reachable = OK"
+      elif [ -n "${SNAP_SSH_FALLBACK:-}" ] && ssh $SSH_OPTS "$SNAP_SSH_FALLBACK" 'exit 0' >/dev/null 2>&1; then
+        echo "probe: T4 archive host reachable = OK (via SNAP_SSH_FALLBACK only — check SNAP_SSH)"
       else
         echo "probe: T4 archive host reachable = FAIL"; rc_all=1
       fi

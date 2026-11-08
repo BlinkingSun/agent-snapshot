@@ -11,24 +11,44 @@ SOURCE="$HOME/Desktop"
 # unchanged files are hardlinked against the previous snapshot and cost ~nothing.
 SNAP_ENABLED=true
 SNAP_SSH="user@archive-host.local"   # single-machine mode: SNAP_SSH="localhost"
+# Optional second address for the same archive host, tried once at run start
+# when SNAP_SSH is unreachable; the run then sticks with whichever answered.
+# Typical pairing: a fixed LAN IP as SNAP_SSH (mDNS .local names can drop out
+# mid-run and strand the post-rsync finalize) and the .local name here in case
+# the IP moves. Make sure known_hosts holds the same host key for both.
+SNAP_SSH_FALLBACK=""
 SNAP_DIR="/Volumes/SnapArchive/agent-snapshot"   # on the DAS, NOT the boot disk
+                                     # (absolute, or relative to the remote $HOME)
 SNAP_RETENTION=90                    # days of snapshot history kept
                                      # NOTE: the archive host's mirror prunes at
                                      # PRUNE_AGE_DAYS (default 100, in engine.py).
                                      # Keep that ABOVE this value + margin — the
                                      # mirror must always outlive the primary.
 SNAP_MIN_FREE_GB=50                  # abort/prune floor, measured on the DAS
+# Publish SNAP_DIR/.changes/<stamp>.json after each incremental run (changed
+# files, file count, bytes) — a hook for an archive-side fast replica path.
+# The bundled engine does not read it; needs GNU rsync on the source. Costs one
+# walk of the new snapshot on the archive host per run, so leave it off unless
+# something consumes it.
+SNAP_CHANGE_SIDECAR=false
 
 # --- Vault leg: compressed, checksum-verified archives on a second host ------
 # Independent second copy in a different format on different hardware.
 VAULT_ENABLED=false
 VAULT_SSH="user@vault-host"
 VAULT_OS="posix"                     # posix | windows (hash + prune tooling differ)
-VAULT_DIR="/backups/agent-snapshot"  # windows example: D:/agent-snapshot
-VAULT_RETENTION=5                    # days of archives kept
+VAULT_DIR="/backups/agent-snapshot"  # windows example: D:/agent-snapshot (drive letter required)
+VAULT_KEEP=0                         # >0: keep the newest N archives (sorted by NAME,
+                                     # immune to touched mtimes) and ignore VAULT_RETENTION
+VAULT_RETENTION=5                    # days of archives kept when VAULT_KEEP=0
+# Optional: refuse the upload unless the vault drive keeps this much free AFTER
+# it lands (archive size + this floor). Set it whenever VAULT_DIR is on the
+# host's OS drive. Unset = no check. An unreadable drive (missing, locked,
+# unmounted) fails the leg with a clear reason instead of an opaque scp error.
+#VAULT_MIN_FREE_GB=40
 
 # --- Plumbing ----------------------------------------------------------------
-STAGE="$HOME/Library/Caches/agent-snapshot"
+STAGE="$HOME/Library/Caches/agent-snapshot"   # each leg locks + stages in $STAGE/<leg>/
 LOGDIR="$HOME/Library/Logs/agent-snapshot"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
