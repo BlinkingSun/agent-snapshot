@@ -53,6 +53,8 @@ STAGING_DIRNAME = ".incoming"
 LATEST = "latest"
 
 STAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$")
+# Unanchored twin of STAMP_RE, for pulling every stamp a problem string mentions (mute matching).
+STAMP_FIND_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}")
 STAMP_FMT = "%Y-%m-%d_%H%M%S"
 
 RSYNC = "/usr/bin/rsync"
@@ -67,11 +69,18 @@ RSYNC = "/usr/bin/rsync"
 # .DS_Store added 2026-08-21 after a REAL production false alarm. Finder writes .DS_Store
 # into any directory it browses, including snapshot dirs on the mounted DAS. Snapshots are
 # immutable once promoted, so the mirror's copy never gains them -- the primary drifts and
-# deep-verify reports a listing mismatch, healthy=false, monitor RED, on an archive with
-# ZERO missing data (every differing path was .DS_Store; nothing was absent from the
-# mirror). The writer already excludes .DS_Store, so these never originate from the backup
-# source and excluding them here loses nothing real. A monitor that goes red because
-# someone opened a Finder window is a monitor people learn to ignore.
+# deep-verify reports "listing mismatch: files 166994/166955", healthy=false, monitor RED,
+# on an archive with ZERO missing data (all 39 differing paths were .DS_Store; nothing was
+# absent from the mirror). The writer already excludes .DS_Store, so these never originate
+# from the backup source and excluding them here loses nothing real. A monitor that goes
+# red because someone opened a Finder window is a monitor people learn to ignore.
+#
+# 2026-08-25: that same false alarm reappeared via a THIRD path -- self.incoming, the
+# .incoming/ staging-dir listing that drives P10 (stuck staging). A Finder browse of
+# .incoming (to clean up a real stale entry) left a .DS_Store there, which does not match
+# any pending stamp and is never cleared by wipe_staging(), so it aged into its own P10 six
+# hours later. EXCLUDES was already applied to the rsync argv and both verify walks but not
+# to this listing -- see excluded() at both `self.incoming = ...` assignments.
 EXCLUDES = (".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".DS_Store")
 
 # 00 F8.3 / 02 hard constraints.  Prefix match: "--del" also catches --delete-before/--delete-excluded
@@ -82,21 +91,48 @@ VERIFY_SWEEP_DAYS = 90        # every promoted snapshot must be content-verified
                               # within this many days -- keep it <= the writer's retention, or
                               # snapshots age out unverified.  See deep_verify().
 VERIFY_MAX_OLDER_PER_PASS = 8 # cost ceiling: each older target is a full two-sided walk plus
-                              # sampled hashing (~2-3 min on a 150k-file snapshot over USB).
-PRUNE_AGE_DAYS = 100          # writer retention (default 90d) + margin. Keep ABOVE the writer's SNAP_RETENTION.
+                              # sampled hashing (~2-3 min on a 146k-file snapshot over USB).
+PRUNE_AGE_DAYS = 100          # 00 F8: 90-day MacBook retention + 10 days of margin.  Do not lower.
 MAX_PRUNES_PER_PASS = 2       # 00 F8: a mass rm -rf is never one bug away.
 MIN_FREE_GB_DEFAULT = 50      # 00 F5 P8 / HANDOFF 4.8
-USED_KB_FAIL_DELTA = 1048576  # 00 F5 P6
-USED_KB_WARN_DELTA = 65536    # 00 F5 notes
-IUSED_FAIL_DELTA = 5000       # 00 F5 P7
+# P6/P7 (whole-volume used-KB / inode delta) were DELETED 2026-08-26 (PLAN A4, owner R4+R5):
+# the drives are declared mixed-use, so a whole-volume statvfs comparison is structurally
+# meaningless in BOTH directions -- nothing may ever compare primary vs replica volume totals
+# again. Replica correctness is proven per snapshot (copy verify, P9, P4, deep-verify) and the
+# manifest-ledger tripwire (check_manifest_ledger) covers the one case only P6/P7 caught:
+# deletion of a promoted replica-only snapshot outside the engine.
+SUPERSEDE_HEALTH_FRACTION = 0.5   # M1: a promote supersedes older failures only if its verified
+SUPERSEDE_HEALTH_MANIFESTS = 7    # file count is >= FRACTION * median(files of the last ~this
+                                  # many manifests). A tiny/void promote must never quietly bury
+                                  # a real failure (the 2026-08-25_180005 10-file pattern).
+PATTERN_FAIL_WINDOW_DAYS = 7  # M1 escalation: N distinct failed stamps within this window ...
+PATTERN_FAIL_MIN = 3          # ... where N >= this fires "P4 PATTERN" (counts superseded too)
+MUTED_ROW_HIDE_HOURS = 72     # A2/M8: rows older than this ship with "hidden": true (UI drops
+                              # them; suppression and endpoint validation use the FULL list)
+LINE_MUTE_EXPIRY_HOURS = 72   # A2: a line mute expires COMPLETELY at 72 h -- the note returns
+RETRY_HISTORY_WINDOW_SEC = 86400  # M8: retry_count counts consumes within the last 24 h
 STALE_STAGING_HOURS = 6       # 00 F5 P10
-SUPPRESS_CAP_SECONDS = 21600  # 00 F5 P14 / F10: 6 h. A copy running longer than this is stuck.
-PENDING_MAX_SECONDS = 21600   # 00 F5 P15: 6 h. A settled stamp still uncopied after this means the
+# 2026-10-23 (the owner): copies now legitimately take ~6 h (656k files), and a monthly deep-verify
+# runs inside a mirror pass right after a copy, so both 6 h caps were raised to 12 h. Previous
+# values (21600) are in engine.py.pre-monthly-verify-20261023-224401.
+SUPPRESS_CAP_SECONDS = 43200  # 00 F5 P14 / F10: 12 h. A copy/verify running longer than this is stuck.
+PENDING_MAX_SECONDS = 43200   # 00 F5 P15: 12 h. A settled stamp still uncopied after this means the
                               # replica is FALLING BEHIND, which is a problem and never just a note.
-DEEP_VERIFY_MAX_AGE_DAYS = 8  # 00 F5 P13
+# MONTHLY DEEP-VERIFY (2026-10-23, the owner: "run this once per month ... after the early morning
+# backup and continue regular backups after it is finished"). The launchd verify windows were
+# retired; instead a MIRROR pass that just promoted an early-morning stamp (hour in
+# DEEP_VERIFY_EARLY_HOURS) runs deep_verify() itself, still holding the lock, once the last
+# successful sweep is >= DEEP_VERIFY_MIN_INTERVAL_HOURS old. Copies queued meanwhile simply wait
+# (passes bounce + heartbeat) and resume on the next pass. Was: 8 days / 20 h, 3 daily windows.
+DEEP_VERIFY_MAX_AGE_DAYS = 35  # 00 F5 P13 -- a monthly sweep plus a few days of slack
+DEEP_VERIFY_MIN_INTERVAL_HOURS = 28 * 24.0  # monthly guard; see deep_verify()
+DEEP_VERIFY_EARLY_HOURS = (3, 4, 5, 6)  # stamp hours that count as "the early morning backup"
 RATE_LIMIT_MAX_AGE_SEC = 86400  # 00 F5 P16: mirror.sh denial artifact self-clears after 24 h
 ORPHAN_FAIL_HOURS = 48        # 00 F5 P11
 ORPHAN_WARN_HOURS = 24        # 00 F5 notes
+HANDSHAKE_STALE_SEC = 180     # on/off switch: 3x the handshake's own ~60s poll interval. Older
+                              # than this and the watchdog itself may be down -- fail OPEN (assume
+                              # reachable, run normally, note it) rather than silently pausing.
 PRIMARY_STALE_DAYS = 2        # 00 F5 P3 (calendar days)
 DEEP_SAMPLE_FILES = 200       # 00 F9
 DEEP_SAMPLE_MAX_BYTES = 64 * 1024 * 1024
@@ -118,7 +154,19 @@ STATUS_KEYS = (
     "primary_snapshots", "replica_snapshots", "latest_primary", "latest_replica",
     "pending", "unsettled", "incoming", "last_copy", "last_deep_verify",
     "mirror_running", "mirror_running_seconds", "healthy", "problems", "notes",
+    "system_enabled", "enabled_source", "handshake_reachable", "handshake_last_change",
+    "control_override", "incomplete_uploads", "dedup_failures", "force_settle_candidates",
+    "muted", "muted_problems", "muted_lines",
 )
+
+# Problem codes a per-snapshot MUTE is allowed to silence.  Strictly per-stamp faults only:
+# muting one snapshot must never be able to hide a VOLUME-level fault that merely happens to
+# name that stamp in passing.  P1/P2/P3/P5/P8/P13/P14/P16, "P4 SYSTEMIC", "P4 PATTERN" and the
+# manifest-ledger tripwire ("promoted snapshot ... is MISSING from the replica") are therefore
+# absent by design and can never be muted by this mechanism.  "P4 SYSTEMIC" and "P4 PATTERN"
+# share the mutable "P4" prefix, so problem_is_muted() excludes BOTH explicitly -- if you add
+# another volume-class escalation under a mutable prefix, carve it out there too.
+MUTABLE_CODES = ("P4", "P9", "P10", "P11", "P12", "P15")
 
 DEFAULT_PRIMARY = "/Volumes/SnapArchive"
 DEFAULT_REPLICA = "/Volumes/SnapMirror"
@@ -151,6 +199,25 @@ def iso_now():
 
 def log_clock():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_ts(ts):
+    """Parse an F4 'date +%Y-%m-%dT%H:%M:%S%z'-style timestamp. Returns an aware datetime, or
+    None if ts is missing/malformed. Same tolerant parser as monitor.py's parse_ts -- duplicated,
+    not imported, matching the existing decoupling between the two components."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        pass
+    try:
+        alt = ts.replace("Z", "+0000")
+        if len(alt) >= 6 and alt[-3] == ":":
+            alt = alt[:-3] + alt[-2:]
+        return datetime.datetime.strptime(alt, "%Y-%m-%dT%H:%M:%S%z")
+    except (ValueError, IndexError):
+        return None
 
 
 def stamp_dt(stamp):
@@ -196,6 +263,30 @@ def read_json(path, default=None):
             return json.load(fh)
     except (IOError, OSError, ValueError):
         return default
+
+
+def read_json_strict(path, default):
+    """(value, corrupt) -- like read_json but DISTINGUISHES absence from corruption (S11).
+
+    `corrupt` is True only when the file EXISTS but cannot be read/parsed as JSON of the
+    default's type. read_json's silent-default behaviour is right for bookkeeping files the
+    engine itself rewrites every pass, and exactly wrong for operator-decision files
+    (muted.json, retry-request.json): one truncated write there and every recorded decision
+    silently ceases to exist. Callers must surface corrupt=True as a problem/note."""
+    try:
+        with open(path, "r") as fh:
+            raw = fh.read()
+    except (IOError, OSError):
+        if os.path.exists(path):
+            return default, True        # exists but unreadable: as loud as unparseable
+        return default, False
+    try:
+        val = json.loads(raw)
+    except ValueError:
+        return default, True
+    if not isinstance(val, type(default)):
+        return default, True            # e.g. muted.json holding a list/null/string
+    return val, False
 
 
 def write_json(path, obj):
@@ -280,6 +371,13 @@ def summarize_tree(root, want_inodes=False, dedup_base=None):
     nlink_gt1 = 0
     inodes = {} if want_inodes else None
     paths = set() if want_inodes else None
+    # SAMPLE POOL (2026-08-26).  Collected here for FREE -- rel/kind/size are already in hand
+    # on this walk.  promote() used to call sample_hashes(), which re-walked the whole staging
+    # tree (~481k lstats, ~14 min on the USB DAS) purely to rebuild this list and then discard
+    # all but 200 entries.  Handing the pool forward removes that entire walk.  It is also
+    # STRICTLY more correct: this pool comes from the same walk that produced the verified
+    # listing_md5, so there is no TOCTOU window between "verified" and "sampled".
+    sample_pool = []
     linked = False
     for rel, kind, size, target, st in walk_tree(root):
         lines.append(listing_line(rel, kind, size, target, st))
@@ -289,6 +387,8 @@ def summarize_tree(root, want_inodes=False, dedup_base=None):
             nfiles += 1
         if kind == "f":
             nbytes += size
+            if size <= MANIFEST_SAMPLE_MAX_FILE_BYTES:
+                sample_pool.append(rel)
             if want_inodes:
                 inodes[rel] = st.st_ino
             if st.st_nlink > 1:
@@ -313,6 +413,7 @@ def summarize_tree(root, want_inodes=False, dedup_base=None):
         "linked_to_base": linked,
         "inodes": inodes,
         "paths": paths,
+        "sample_pool": sample_pool,
     }
 
 
@@ -352,11 +453,22 @@ def inode_map(root):
     return out
 
 
-def sample_hashes(root, stamp):
+def sample_hashes(root, stamp, pool=None):
     """Deterministic bounded content fingerprint of a tree that has JUST been verified (C12).
-    Seeded on the stamp alone so the same paths are re-checked on every later deep-verify."""
-    eligible = sorted(rel for rel, kind, size, _t, _st in walk_tree(root)
-                      if kind == "f" and size <= MANIFEST_SAMPLE_MAX_FILE_BYTES)
+    Seeded on the stamp alone so the same paths are re-checked on every later deep-verify.
+
+    `pool`, when given, is the eligible-relpath list already collected by summarize_tree's
+    walk of this same tree -- passing it skips a redundant full traversal.  Omit it (None)
+    and the tree is walked, which is what the deep-verify/backfill callers still do because
+    they have no adjacent summarize_tree of that tree."""
+    if pool is not None:
+        # Pool handed in by summarize_tree's walk (see its `sample_pool`).  Same predicate,
+        # same tree, no second traversal.  sorted() because the caller's list is in walk
+        # order and the RNG below is seeded to be reproducible over a STABLE ordering.
+        eligible = sorted(pool)
+    else:
+        eligible = sorted(rel for rel, kind, size, _t, _st in walk_tree(root)
+                          if kind == "f" and size <= MANIFEST_SAMPLE_MAX_FILE_BYTES)
     if not eligible:
         return {}
     if len(eligible) <= MANIFEST_SAMPLE_FILES:
@@ -577,8 +689,15 @@ class Engine(object):
         self.pending = []
         self.unsettled = []
         self.corpses = []
+        self.incomplete = []
         self.orphan_partial = None
         self.mirror_running = False
+        # PER-PHASE TIMING (2026-08-26). Purely observational -- nothing reads this but the log
+        # line at the end of a copy. Added because two successive "this will be faster" changes
+        # were predicted from a COST MODEL and both missed: the model priced every full-tree walk
+        # at its cold-cache rate, but the staging tree is hot in the buffer cache the moment rsync
+        # finishes writing it, so the walks are NOT equally expensive. Stop inferring, measure.
+        self.phase_times = {}
 
         self.persist = read_json(self.persist_path, {}) or {}
         self.seen = read_json(self.seen_path, {}) or {}
@@ -586,6 +705,61 @@ class Engine(object):
         self.staging_meta = read_json(self.staging_meta_path, {}) or {}
         self.pending_since = read_json(self.pending_path, {}) or {}
         self.grandfathered = read_json(self.grandfathered_path, None)
+
+        # on/off switch (single writer each): handshake.json <- handshake.py only;
+        # control-override.json <- this engine's own "enable"/"disable" mode only.
+        self.handshake_path = os.path.join(self.state_dir, "handshake.json")
+        self.control_path = os.path.join(self.state_dir, "control-override.json")
+        self.incomplete_path = os.path.join(self.state_dir, "incomplete.json")
+        self.skip_dedup_path = os.path.join(self.state_dir, "skip-dedup.json")
+        self.force_settle_path = os.path.join(self.state_dir, "force-settle.json")
+        # Retry opt-back-in for SUPERSEDED failures (A3): same add-by-monitor/consume-by-engine
+        # pattern as skip-dedup/force-settle. Deliberately NOT read here: consume_retry_requests()
+        # re-reads it at the consume point (F10), which shrinks the monitor-write clobber window
+        # from a whole pass to microseconds.
+        self.retry_request_path = os.path.join(self.state_dir, "retry-request.json")
+        self.handshake = read_json(self.handshake_path, {}) or {}
+        self.control_override = read_json(self.control_path, {}) or {}
+        self.incomplete_marks = read_json(self.incomplete_path, {}) or {}
+        # Single writer: monitor.py's POST /api/control/skip-dedup ONLY (a human click or an
+        # agent's API call) -- never engine.py itself. Consumed (removed) here on first
+        # successful use of each entry; see verify_and_audit()'s 5c dedup assertion.
+        self.skip_dedup = read_json(self.skip_dedup_path, {}) or {}
+        # Single writer: monitor.py's POST /api/control/force-settle ONLY. Forces classify() to
+        # treat an UNSETTLED stamp as settled -- a bigger override than skip-dedup, gated on the
+        # was_latest safety invariant in classify() itself (see there for why that makes this
+        # safe even if marked carelessly: a stamp that was never was_latest is refused, not
+        # silently accepted, because that's corpse-tracking's own proof the writer actually
+        # finished it at some point, as opposed to it possibly still being mid-upload right now).
+        self.force_settle = read_json(self.force_settle_path, {}) or {}
+        # Single writer: monitor.py's POST /api/control/mute + /unmute ONLY. UNLIKE skip-dedup and
+        # force-settle this is NEVER consumed on use -- that is exactly what makes it PERMANENT.
+        # A muted stamp (a) is never retried (it leaves self.pending), and (b) has its per-stamp
+        # problems moved out of problems[] into muted_problems[], so `healthy` stops being pinned
+        # false by a snapshot the operator has deliberately written off. It stays fully visible in
+        # status.muted / status.muted_problems -- muted is "acknowledged", never "hidden".
+        # Removing a stamp from this file (POST /unmute) restores every one of those behaviours.
+        self.muted_path = os.path.join(self.state_dir, "muted.json")
+        # S11: an operator-decision file that EXISTS but cannot be parsed must never silently
+        # become {} -- check_state_file_integrity() turns the flag into a problem on every pass.
+        self.muted, self.muted_parse_error = read_json_strict(self.muted_path, {})
+        self.muted_stamps = []
+        # A1/F15: stamps whose failure record was closed as superseded. classify() populates it
+        # on a full pass; it MUST also exist (empty) on the lock-held heartbeat path, where
+        # classify() never runs -- status rows never derive from it (M9: they derive from
+        # persist["failed_copies"] inside muted_records()).
+        self.superseded_stamps = []
+        self.muted_problems = []
+        # LINE mutes: the per-snapshot mute above can only silence per-stamp problems, so it
+        # cannot touch a note or a stamp-less problem (P16, P13, the space-delta notes...). This
+        # covers everything else, keyed by the line's SHAPE rather than its exact text -- see
+        # line_key(). Single writer: monitor.py POST /api/control/mute-line + /unmute-line.
+        self.muted_lines_path = os.path.join(self.state_dir, "muted-lines.json")
+        self.muted_lines, self.muted_lines_parse_error = \
+            read_json_strict(self.muted_lines_path, {})    # S11: same class as muted.json
+        self.muted_line_hits = []
+        self.enabled = True
+        self.enabled_source = "handshake"
 
         self.last_copy = self.persist.get("last_copy")
         self.last_deep_verify = self.persist.get("last_deep_verify")
@@ -762,6 +936,9 @@ class Engine(object):
         self.probe(write_state=False)
         self.mirror_running = True
         self.lock_held_health(held_pid)
+        # lock_held_health() can raise P10, which IS mutable -- so this path must honour mutes too,
+        # or a muted stamp's stuck staging would still pin the banner red for the whole copy.
+        self.apply_mutes()
         cur = read_json(self.status_path)
         if isinstance(cur, dict) and cur.get("schema") == SCHEMA:
             # preserve the last completed pass's view of the trees; the holder owns those fields
@@ -776,6 +953,9 @@ class Engine(object):
             cur["problems"] = list(self.problems)
             cur["notes"] = list(self.notes)
             cur["healthy"] = not self.problems
+            cur["muted"] = self.muted_records()
+            cur["muted_problems"] = list(self.muted_problems)
+            cur["muted_lines"] = self.muted_line_records()
             try:
                 write_atomic(self.status_path,
                              json.dumps(cur, indent=1, sort_keys=True) + "\n")
@@ -798,6 +978,7 @@ class Engine(object):
         self.check_stuck_copy()
         self.check_deep_verify_age()
         self.check_pending_age()
+        self.check_state_file_integrity()   # S11: corrupt operator state is loud here too
         self.note("a copy is in progress (lock held by pid=%s)" % held_pid)
 
     def update_pending_tracker(self):
@@ -839,31 +1020,6 @@ class Engine(object):
             self.problem("P15 snapshot %s has been settled and awaiting copy for %.1f h (> %d h): "
                          "the replica is BEHIND and is not catching up%s"
                          % (worst, worst_age / 3600.0, PENDING_MAX_SECONDS // 3600, extra))
-
-    def check_stuck_copy(self):
-        """00 F5 P14."""
-        secs = self.busy_seconds()
-        if secs > SUPPRESS_CAP_SECONDS:
-            self.problem("P14 a copy has claimed to be running for %.1f h (> %d h): stuck copy, or "
-                         "a foreign process is holding %s"
-                         % (secs / 3600.0, SUPPRESS_CAP_SECONDS // 3600, self.lock_path))
-
-    def check_deep_verify_age(self):
-        """00 F5 P13.  An absent safety net is a problem, not a neutral state."""
-        ok_ts = self.persist.get("last_deep_verify_ok_ts")
-        if not ok_ts:
-            self.problem("P13 deep-verify has NEVER completed successfully: F9 sampled content "
-                         "hashing is the only cover for bit rot and for F9's documented residual, "
-                         "so until it runs once nothing is checking replica CONTENT")
-            return
-        try:
-            t = time.mktime(time.strptime(ok_ts[:19], "%Y-%m-%dT%H:%M:%S"))
-        except ValueError:
-            return
-        age_days = (time.time() - t) / 86400.0
-        if age_days > DEEP_VERIFY_MAX_AGE_DAYS:
-            self.problem("P13 last successful deep-verify was %.1f days ago (> %d): the content "
-                         "safety net has stopped running" % (age_days, DEEP_VERIFY_MAX_AGE_DAYS))
 
     def _read_rate_limit_artifact(self):
         """Read mirror.sh's last-rate-limit.json.  Missing/empty/truncated/malformed -> None."""
@@ -927,6 +1083,31 @@ class Engine(object):
             self.event("rate_limited", None, detail)
             self.persist["last_rate_limit_event_ts"] = denial["ts"]
             write_json(self.persist_path, self.persist)
+
+    def check_stuck_copy(self):
+        """00 F5 P14."""
+        secs = self.busy_seconds()
+        if secs > SUPPRESS_CAP_SECONDS:
+            self.problem("P14 a copy has claimed to be running for %.1f h (> %d h): stuck copy, or "
+                         "a foreign process is holding %s"
+                         % (secs / 3600.0, SUPPRESS_CAP_SECONDS // 3600, self.lock_path))
+
+    def check_deep_verify_age(self):
+        """00 F5 P13.  An absent safety net is a problem, not a neutral state."""
+        ok_ts = self.persist.get("last_deep_verify_ok_ts")
+        if not ok_ts:
+            self.problem("P13 deep-verify has NEVER completed successfully: F9 sampled content "
+                         "hashing is the only cover for bit rot and for F9's documented residual, "
+                         "so until it runs once nothing is checking replica CONTENT")
+            return
+        try:
+            t = time.mktime(time.strptime(ok_ts[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            return
+        age_days = (time.time() - t) / 86400.0
+        if age_days > DEEP_VERIFY_MAX_AGE_DAYS:
+            self.problem("P13 last successful deep-verify was %.1f days ago (> %d): the content "
+                         "safety net has stopped running" % (age_days, DEEP_VERIFY_MAX_AGE_DAYS))
 
     def check_clock_skew(self, prev_ts):
         """FG5, engine half.  The monitor clamps stale_seconds at 0 (F10); the engine can also SEE
@@ -1001,6 +1182,10 @@ class Engine(object):
         daily false alarm after every successful backup into a correct reading.
         A backup monitor that cries wolf once per day trains its owner to ignore it,
         which is worse than having no monitor at all.
+
+        2026-08-26: P6/P7 themselves were deleted (PLAN A4 -- mixed-use drives), but this
+        re-probe STAYS: the status volume fields and P8 free-space must still describe the
+        post-copy world, not the pre-copy one.
         """
         if self.primary_mounted:
             self.stat_primary = self.statvfs_of(self.primary)
@@ -1023,7 +1208,7 @@ class Engine(object):
             self.replica_snapshots = self.list_snapshots(self.replica_snapdir)
             self.latest_replica = self.read_latest(self.replica_snapdir)
             try:
-                self.incoming = sorted(os.listdir(self.staging_root))
+                self.incoming = sorted(n for n in os.listdir(self.staging_root) if not excluded(n))
             except OSError:
                 self.incoming = []
 
@@ -1145,13 +1330,40 @@ class Engine(object):
         self.corpses = []
         self.unsettled = []
         self.pending = []
+        self.incomplete = []
+        self.refused_force_settle = []
+        self.muted_stamps = []
+        self.superseded_stamps = []
         if not self.primary_mounted:
             return
         cur = self.latest_primary if not self.latest_primary_dangling else None
         promoted = set(self.replica_snapshots)
+        marked_incomplete = set(self.incomplete_marks)
+        was_latest = set(self.seen.get("was_latest") or [])
         for s in self.primary_snapshots:
+            if s in marked_incomplete:
+                # On/off switch: handshake.py positively marked this stamp incomplete (connection
+                # to the MacBook was lost mid-write and the dir stopped growing). Invisible to
+                # pending/corpses/orphan_partial by design -- "incomplete is not a failure."
+                self.incomplete.append(s)
+                continue
             if s in self.settle_override:
                 settled = True
+            elif s in self.force_settle and s in was_latest:
+                # Operator override (monitor.py POST /api/control/force-settle): this stamp WAS
+                # observed as primary's own `latest` at some point -- was_latest is corpse-
+                # tracking's own proof of a genuinely COMPLETED upload, so this can never be used
+                # to bypass protection against a stamp that might still be mid-write right now.
+                # Needed when something ELSE (e.g. a primary-side restore) moves `latest`
+                # backward past a stamp that had already legitimately finished.
+                settled = True
+            elif s in self.force_settle:
+                # Marked, but NOT was_latest -- refuse rather than silently no-op (00 F5's own
+                # standard: an unclear non-action is worse than a loud one). Most likely this
+                # names a stamp that is genuinely still being written; forcing it would be exactly
+                # the corpse-protection failure this whole check exists to prevent.
+                self.refused_force_settle.append(s)
+                settled = False
             elif cur is None:
                 settled = False          # broken/missing latest => nothing settles (00 F8) + P2
             elif s > cur:
@@ -1164,12 +1376,36 @@ class Engine(object):
             if not settled:
                 self.unsettled.append(s)
             elif s not in promoted:
-                self.pending.append(s)
+                if s in self.muted:
+                    # Operator wrote this snapshot off (monitor.py POST /api/control/mute). It
+                    # leaves `pending` so the copy loop stops spending a full multi-minute attempt
+                    # on it every StartInterval, and so P15 stops counting it as "the replica is
+                    # BEHIND and is not catching up". It is NOT forgotten: it stays fully visible
+                    # in the status.muted ledger until the stamp leaves both volumes, and unmuting
+                    # puts it straight back into `pending`. (The muted branch deliberately wins
+                    # over the superseded one below, so Unmute keeps working as documented.)
+                    self.muted_stamps.append(s)
+                elif self._is_superseded(s):
+                    # A1/R1: a later healthy promote closed this stamp's failure record as
+                    # superseded -- "the most recent backup is the most important one". It leaves
+                    # `pending` (never retried automatically again; the operator can opt back in
+                    # via POST /api/control/retry -> consume_retry_requests()), and its record
+                    # survives in persist["failed_copies"] as history and in status as a
+                    # kind="superseded" row.
+                    self.superseded_stamps.append(s)
+                else:
+                    self.pending.append(s)
         self.pending.sort()
         self.unsettled.sort()
+        self.incomplete.sort()
+        self.muted_stamps.sort()
+        self.superseded_stamps.sort()
 
-        # orphan partial: newest primary stamp is not the latest target (00 F5 P11)
-        if self.primary_snapshots and cur and self.primary_snapshots[-1] != cur:
+        # orphan partial: newest primary stamp is not the latest target (00 F5 P11).
+        # A marked-incomplete newest stamp is excluded here too -- otherwise it dodges P12 only to
+        # trip a different problem/note 24-48h later, which still breaks "no warning necessary."
+        if self.primary_snapshots and cur and self.primary_snapshots[-1] != cur \
+                and self.primary_snapshots[-1] not in marked_incomplete:
             self.orphan_partial = self.primary_snapshots[-1]
 
     def emit_detected(self):
@@ -1236,6 +1472,18 @@ class Engine(object):
         gf = set(self.grandfathered or [])
         for cand in sorted(self.replica_snapshots, reverse=True):
             if cand >= s or cand not in primary_set:
+                continue
+            if cand in self.muted:
+                # A snapshot the operator VOIDED is not a trustworthy dedup reference. Real case
+                # (2026-08-26): 2026-08-25_180005 was captured mid-restore and holds 10 files, but
+                # being the newest promoted stamp it was picked as the base for a 37 GB copy. No
+                # staged file could possibly share an inode with a 10-file tree, so the 5c dedup
+                # assertion fired and the copy failed -- and would have failed on every retry,
+                # because base selection is deterministic. Skipping muted stamps falls through to
+                # the last GOOD snapshot (here 2026-08-25_120003, 474922 files), which both fixes
+                # the failure and restores real dedup. Voided as a restore point == voided as a
+                # reference point; the two must not diverge.
+                self.log("base: skipping %s (muted/voided) as a --link-dest candidate" % cand)
                 continue
             if self.read_manifest(cand) is None and cand not in gf:
                 if not self.reverify_promoted(cand):
@@ -1310,15 +1558,268 @@ class Engine(object):
             self.persist["failed_copies"] = fails
             write_json(self.persist_path, self.persist)
 
-    def gc_copy_failures(self):
-        """Keep only stamps that are still on the primary AND still missing from the replica.
-        A stamp that was later copied, pruned, or removed from the primary stops being a problem."""
+    # ------------------------------------------------- supersede-on-success (A1/R1 + M1 gate)
+
+    def _is_superseded(self, s):
+        """True iff the stamp's failure record is closed as superseded. getattr-safe: the
+        status-row builders run on the lock-held path and under tests whose Fakes skip
+        __init__ (F15/F23)."""
+        rec = ((getattr(self, "persist", None) or {}).get("failed_copies") or {}).get(s)
+        return bool(isinstance(rec, dict) and rec.get("superseded_by"))
+
+    def _superseded_set(self):
+        """Every stamp whose failure record carries superseded_by -- derived ONLY from
+        persist["failed_copies"], never classify state, so it is identical on both status
+        writers (M9/F15)."""
+        out = set()
+        fails = (getattr(self, "persist", None) or {}).get("failed_copies") or {}
+        for k, v in fails.items():
+            if isinstance(v, dict) and v.get("superseded_by"):
+                out.add(k)
+        return out
+
+    def _manifest_files_median(self, exclude=None):
+        """Median of the `files` counts over the last ~SUPERSEDE_HEALTH_MANIFESTS per-stamp
+        manifests in manifests/ (top level only: prune() moves a pruned stamp's manifest into
+        manifests/pruned/, and that subdirectory name never matches the <stamp>.json filter).
+        `exclude` drops the stamp being judged, so a tiny promote cannot drag its own baseline
+        down. Returns None when no usable manifest exists (no baseline)."""
+        try:
+            names = os.listdir(self.manifest_dir)
+        except OSError:
+            return None
+        stamps = sorted(n[:-5] for n in names
+                        if n.endswith(".json") and STAMP_RE.match(n[:-5]))
+        vals = []
+        for s in reversed(stamps):          # newest first
+            if exclude is not None and s == exclude:
+                continue
+            man = self.read_manifest(s)
+            files = man.get("files") if isinstance(man, dict) else None
+            if isinstance(files, (int, float)) and not isinstance(files, bool):
+                vals.append(float(files))
+            if len(vals) >= SUPERSEDE_HEALTH_MANIFESTS:
+                break
+        if not vals:
+            return None
+        vals.sort()
+        mid = len(vals) // 2
+        if len(vals) % 2:
+            return vals[mid]
+        return (vals[mid - 1] + vals[mid]) / 2.0
+
+    def supersede_health_ok(self, files, exclude=None):
+        """M1 health gate: a promote may supersede older failures ONLY if its verified file
+        count is >= SUPERSEDE_HEALTH_FRACTION * median(recent manifest file counts). The
+        2026-08-25_180005 pattern is real: a 10-file snapshot captured mid-restore PROMOTED
+        CLEANLY (verify proves staging==primary, not staging==good) -- such a void promote
+        must never quietly bury a real failure. No baseline (first promotes) => gate passes;
+        an unreadable/missing files count => gate FAILS (conservative: keep the failure loud)."""
+        if not isinstance(files, (int, float)) or isinstance(files, bool):
+            return False
+        med = self._manifest_files_median(exclude=exclude)
+        if med is None:
+            return True
+        return files >= SUPERSEDE_HEALTH_FRACTION * med
+
+    def purge_pending(self, s):
+        """F1(b): a stamp that just became superseded must leave BOTH self.pending and
+        pending.json immediately. Otherwise update_pending_tracker() re-writes its key at the
+        end of this very pass and check_pending_age() -- which reads pending.json and runs on
+        every heartbeat -- keeps firing P15 for a stamp that will never be retried."""
+        if s in (getattr(self, "pending", None) or []):
+            self.pending.remove(s)
+        if s in (getattr(self, "pending_since", None) or {}):
+            del self.pending_since[s]
+            write_json(self.pending_path, self.pending_since)
+
+    def supersede_older_failures(self, s):
+        """A1/R1 hook, called from pass_body at the single point that covers BOTH promote
+        paths (normal copy and try_recover_staging -- copy_stamp() returns True for both):
+        after stamp S promotes, close every older open failure record as superseded, so the
+        banner clears on the next success with no operator action.
+
+        Health-gated (M1): judged on S's own just-written manifest. F16: mutates self.persist
+        in memory (record_copy_failure idiom) and never re-reads persist.json from disk, so a
+        concurrent heartbeat cannot resurrect stale state through this path."""
+        fails = dict(self.persist.get("failed_copies") or {})
+        older = [f for f in sorted(fails)
+                 if f < s and not (isinstance(fails.get(f), dict)
+                                   and fails[f].get("superseded_by"))]
+        if not older:
+            return
+        man = self.read_manifest(s)
+        files = man.get("files") if isinstance(man, dict) else None
+        if not self.supersede_health_ok(files, exclude=s):
+            self.log("supersede: promote of %s (files=%s) fails the health gate (< %d%% of the "
+                     "recent manifest median); older failure(s) %s stay open"
+                     % (s, files, int(SUPERSEDE_HEALTH_FRACTION * 100), ", ".join(older)))
+            return
+        now = iso_now()
+        for f in older:
+            rec = fails.get(f)
+            rec = dict(rec) if isinstance(rec, dict) else {}
+            rec["superseded_by"] = s
+            rec["superseded_at"] = now
+            fails[f] = rec
+        self.persist["failed_copies"] = fails
+        write_json(self.persist_path, self.persist)
+        for f in older:
+            self.log("supersede: failed copy of %s superseded by successful copy of %s" % (f, s))
+            self.event("superseded", f,
+                       "failed copy superseded by successful copy of %s; kept as history, "
+                       "no longer retried (POST /api/control/retry to opt back in)" % s)
+            self.purge_pending(f)
+
+    def consume_retry_requests(self):
+        """A3/F10 consume point: pass start, AFTER probe(), BEFORE classify(), gated on both
+        volumes mounted. Re-reads retry-request.json HERE (never the __init__ snapshot) and
+        rewrites it, shrinking the monitor-add/engine-consume clobber window to microseconds --
+        retry-request.json follows the same monitor-adds/engine-consumes contract as
+        skip-dedup.json and force-settle.json.
+
+        Semantics (F10): a request naming a stamp whose failure record is superseded -> delete
+        the record entirely (classify() runs right after this, so the stamp re-enters pending
+        naturally THIS pass); anything else -> drop the request and log it; never an error.
+        M8: every honoured consume appends iso_now() to persist["retry_history"][stamp]
+        (trimmed to RETRY_HISTORY_WINDOW_SEC) -- that survives the record's deletion and any
+        later re-failure, and is what feeds the status row's retry_count that the monitor's
+        >=3-in-24h cooldown validates against."""
         if not (self.primary_mounted and self.replica_mounted):
             return
-        fails = self.persist.get("failed_copies") or {}
+        reqs, corrupt = read_json_strict(self.retry_request_path, {})
+        if corrupt:
+            # S11: an explicit operator request that cannot be read must be loud, never a
+            # silent {}. Absence stays silent (read_json_strict distinguishes the two).
+            self.note("retry-request.json exists but cannot be parsed -- no retry request can "
+                      "be honoured until it is fixed or removed (%s)" % self.retry_request_path)
+            return
+        if not reqs:
+            return
+        fails = dict(self.persist.get("failed_copies") or {})
+        history = dict(self.persist.get("retry_history") or {})
+        persist_dirty = False
+        for s in sorted(reqs):
+            rec = fails.get(s)
+            if isinstance(rec, dict) and rec.get("superseded_by"):
+                del fails[s]
+                times = [t for t in (history.get(s) or []) if isinstance(t, str)]
+                times.append(iso_now())
+                cutoff = time.time() - RETRY_HISTORY_WINDOW_SEC
+                kept = []
+                for t in times:
+                    dt = parse_ts(t)
+                    if dt is None or dt.timestamp() >= cutoff:
+                        kept.append(t)      # unparseable entries are kept: they can only make
+                                            # the retry cooldown STRICTER, never looser
+                history[s] = kept
+                persist_dirty = True
+                self.log("retry: consumed operator request for superseded stamp %s -- failure "
+                         "record dropped, it re-enters pending this pass (consume %d in 24 h)"
+                         % (s, len(kept)))
+                self.event("retry_consumed", s,
+                           "operator retry request consumed; superseded failure record removed "
+                           "so the stamp re-enters pending")
+            else:
+                self.log("retry: request for %s ignored (no superseded failure record for it); "
+                         "request removed" % s)
+        if persist_dirty:
+            self.persist["failed_copies"] = fails
+            self.persist["retry_history"] = history
+            write_json(self.persist_path, self.persist)
+        write_json(self.retry_request_path, {})
+
+    def consume_skip_dedup(self, s):
+        """Called once a stamp that used the skip-dedup override has actually PROMOTED (never
+        speculatively) -- one-time use, same shape as engine.py's other single-writer state
+        files. Shared by copy_stamp()'s normal path and try_recover_staging()'s crash-recovery
+        path so this lives in exactly one place."""
+        if s not in self.skip_dedup:
+            return
+        mark = self.skip_dedup.pop(s)
+        write_json(self.skip_dedup_path, self.skip_dedup)
+        self.event("dedup_skipped", s, "promoted without a shared inode against the base, by "
+                                       "operator override (reason: %s)"
+                                       % (mark.get("reason") or "none given"))
+
+    def consume_force_settle(self, s):
+        """Same one-time-use shape as consume_skip_dedup(), for the force-settle override."""
+        if s not in self.force_settle:
+            return
+        mark = self.force_settle.pop(s)
+        write_json(self.force_settle_path, self.force_settle)
+        self.event("force_settled", s, "promoted despite primary `latest` not currently "
+                                       "pointing at or past it, by operator override "
+                                       "(reason: %s)" % (mark.get("reason") or "none given"))
+
+    def gc_copy_failures(self):
+        """Failure-ledger GC + the F1(c) supersede backstop. Never runs while a volume is
+        unmounted (an unreadable disk must not look like a pruned snapshot).
+
+        Keep-rule (F5):
+          - an OPEN failure stays while the stamp is on the primary, missing from the replica,
+            and not muted. A muted stamp is a CLOSED failure the operator accepted: dropping
+            its record is what stops P4 re-deriving it every pass; the decision survives in
+            muted.json, and unmuting puts the stamp straight back into pending so a real
+            failure re-derives from scratch. (Muted wins over superseded, here and in
+            classify(), so Unmute keeps working.)
+          - a SUPERSEDED record is history ("just in case") and stays while the stamp exists
+            on EITHER volume; it is dropped only once the stamp is gone from both.
+
+        F1(c) backstop, idempotent: a SIGKILL can land between promote()'s os.rename and
+        pass_body's supersede write. Any un-superseded failure with a NEWER promoted stamp on
+        the replica is marked superseded here -- which also applies R1 retroactively at
+        install (failed_copies is {} today, so no latent effect) and makes the pass_body hook
+        a latency optimization. The backstop honours the same M1 health gate as the hook:
+        only a promoted stamp whose manifest passes supersede_health_ok() counts, and the
+        NEWEST such stamp is recorded as the superseder."""
+        if not (self.primary_mounted and self.replica_mounted):
+            return
+        fails = dict(self.persist.get("failed_copies") or {})
+        changed = False
+
+        gate_cache = {}
+
+        def _healthy_promote(cand):
+            if cand not in gate_cache:
+                man = self.read_manifest(cand)
+                files = man.get("files") if isinstance(man, dict) else None
+                gate_cache[cand] = self.supersede_health_ok(files, exclude=cand)
+            return gate_cache[cand]
+
+        for f in sorted(fails):
+            rec = fails.get(f)
+            if isinstance(rec, dict) and rec.get("superseded_by"):
+                continue
+            if f in self.muted:
+                continue        # muted wins; the keep-rule below drops the record as before
+            sup = None
+            for cand in sorted(self.replica_snapshots, reverse=True):
+                if cand <= f:
+                    break
+                if _healthy_promote(cand):
+                    sup = cand
+                    break
+            if sup:
+                rec = dict(rec) if isinstance(rec, dict) else {}
+                rec["superseded_by"] = sup
+                rec["superseded_at"] = iso_now()
+                fails[f] = rec
+                changed = True
+                self.log("supersede backstop: failed copy of %s superseded by promoted %s"
+                         % (f, sup))
+                self.purge_pending(f)
+
         live = set(self.primary_snapshots) - set(self.replica_snapshots)
-        keep = dict((k, v) for k, v in fails.items() if k in live)
-        if keep != fails:
+        either = set(self.primary_snapshots) | set(self.replica_snapshots)
+        keep = {}
+        for k, v in fails.items():
+            if isinstance(v, dict) and v.get("superseded_by"):
+                if k in either:
+                    keep[k] = v
+            elif k in live and k not in self.muted:
+                keep[k] = v
+        if changed or keep != (self.persist.get("failed_copies") or {}):
             self.persist["failed_copies"] = keep
             write_json(self.persist_path, self.persist)
 
@@ -1328,6 +1829,26 @@ class Engine(object):
                           "detail": detail}
         self.persist["last_copy"] = self.last_copy
         write_json(self.persist_path, self.persist)
+
+    def tmark(self, name, t0):
+        """Accumulate elapsed seconds under `name`. Observational only -- never raises, never
+        affects control flow, and a failure here must never cost a copy."""
+        try:
+            self.phase_times[name] = self.phase_times.get(name, 0.0) + (time.time() - t0)
+        except Exception:
+            pass
+
+    def phase_line(self):
+        """'rsync=1200.4s src_walk=830.1s ...' ordered slowest-first, plus the share of the
+        measured total each phase accounts for. Empty string if nothing was recorded."""
+        try:
+            if not self.phase_times:
+                return ""
+            tot = sum(self.phase_times.values()) or 1.0
+            parts = sorted(self.phase_times.items(), key=lambda kv: kv[1], reverse=True)
+            return " ".join("%s=%.1fs/%.0f%%" % (k, v, 100.0 * v / tot) for k, v in parts)
+        except Exception:
+            return ""
 
     def copy_stamp(self, s):
         """Returns True on promote.  Raises nothing; records problems/events itself."""
@@ -1341,10 +1862,11 @@ class Engine(object):
             self.log("base %s vanished before rsync; falling back to a full copy" % base)
             base, link_dest = None, None
         if link_dest and self.bogus_link_dest:
-            link_dest += "-MBPA-TEST-BOGUS"          # test knob, gated on SNAP_* redirection
+            link_dest += "-SNAP-TEST-BOGUS"          # test knob, gated on SNAP_* redirection
 
         staging = None
         summary = None
+        baseless_retry = False     # 2026-09-05: at most ONE basis-unreadable fallback per stamp
         try:
             staging = self.staging_path(s)
             if self.try_recover_staging(s, base, link_dest, started):
@@ -1357,7 +1879,10 @@ class Engine(object):
                      (s, " --link-dest=" + link_dest if link_dest else " (full copy, no base)",
                       len(self.pending)))
             t0 = time.time()
+            self.phase_times = {}          # per-copy, so the line describes THIS copy only
+            _tp = time.time()
             rc, _out, err = run_rsync(argv)
+            self.tmark("rsync", _tp)
             self.crashpoint("after_rsync")
             if is_openrsync_abort(rc, err):
                 # DEFENSIVE ONLY.  With -H gone this must not happen; if it does, an openrsync
@@ -1369,6 +1894,41 @@ class Engine(object):
                 self.note("UNEXPECTED openrsync internal abort while copying %s (rc=%d) - "
                           "investigate; this should not happen now that -H is not shipped"
                           % (s, rc))
+            # BASIS-UNREADABLE FALLBACK (2026-09-05).  openrsync can fail rc=11 reading the
+            # --link-dest BASIS rather than the source.  Trigger: the basis entry is a SYMLINK and
+            # the source entry is a REGULAR FILE -- a symlink->file change between snapshots, which
+            # is a routine developer action.  Types differ so it cannot hardlink, it falls through
+            # to copy_file using the basis as the read side, and its openat(O_NOFOLLOW) on a symlink
+            # returns ELOOP on BSD.  The message reads "Too many levels of symbolic links" but there
+            # is NO loop and nothing is corrupt -- O_NOFOLLOW simply refuses a symlink.  openrsync
+            # never checks the basis entry is a regular file first (GNU rsync does).  The whole copy
+            # aborts, and because base selection is deterministic EVERY retry hits the same entry:
+            # observed 7 consecutive failures 05:29-12:15 on 2026-09-05_043549, replica stuck 7.2 h.
+            # Fall back to ONE baseless copy.  Self-healing: once this stamp promotes it becomes the
+            # next base and holds the regular file, so dedup returns on the following copy.  Cost is
+            # this stamp's dedup only.  DO NOT "fix" this by muting the base to skip it -- every
+            # candidate back to the symlink's creation carries it, and falling back that far is what
+            # produced the 451,391-violator repair storm on 2026-08-26.
+            # `base` MUST go None alongside link_dest, or verify_and_audit's 5c dedup assertion
+            # would fail a tree that legitimately shares no inode with any base.
+            if (rc == 11 and link_dest and not baseless_retry
+                    and link_dest.rstrip("/") in (err or "")):
+                baseless_retry = True
+                for line in [l for l in err.splitlines() if l.strip()][:3]:
+                    self.log("  rsync: " + line.strip())
+                self.log("copy %s: rsync rc=11 while reading the basis %s -- retrying ONCE with no "
+                         "--link-dest (this stamp forgoes dedup; later copies regain it)"
+                         % (s, base))
+                self.event("baseless_retry", s,
+                           "rc=11 against basis %s; retrying without link_dest" % (base or "none"))
+                link_dest = None
+                base = None
+                staging = self.wipe_staging(s)   # 00 F8 2b: wipe-then-create before EVERY rsync
+                argv = build_copy_argv(src, staging, None, self.inject_flag)
+                _tp = time.time()
+                rc, _out, err = run_rsync(argv)
+                self.tmark("rsync_baseless", _tp)
+                self.crashpoint("after_rsync")
             if rc != 0:
                 # openrsync has NO rc=24 (00 F8 step 4 / 01 E6): a vanished file and a TCC denial
                 # are the SAME code.  No rc but 0 may be treated as benign.
@@ -1382,8 +1942,18 @@ class Engine(object):
             self.record_attempt(s, started, 0, summary["files"], summary["bytes"], base, detail)
             self.log("copy %s: OK %d file(s) %d byte(s) in %.1fs; %s" %
                      (s, summary["files"], summary["bytes"], dt, detail))
+            # Per-phase breakdown, log-only (2026-08-26). `unattributed` is wall time inside the
+            # copy that no timer covered -- if it is large, the instrumentation is missing a phase.
+            _pl = self.phase_line()
+            if _pl:
+                _acct = sum(self.phase_times.values())
+                self.log("copy %s: phases %s unattributed=%.1fs (%.1f%% of %.1fs total)"
+                         % (s, _pl, max(0.0, dt - _acct),
+                            100.0 * max(0.0, dt - _acct) / (dt or 1.0), dt))
             self.event("copied", s, "files=%d bytes=%d link_dest=%s; %s" %
                        (summary["files"], summary["bytes"], base or "none", detail))
+            self.consume_skip_dedup(s)
+            self.consume_force_settle(s)
             self.clear_copy_failure(s)
             return True
         except CopyFailure as cf:
@@ -1431,6 +2001,8 @@ class Engine(object):
             self.log("recovery: staging for %s unreadable (%s); rebuilding" % (s, exc))
             return False
         self.promote(s, staging, summary, link_dest, base)
+        self.consume_skip_dedup(s)
+        self.consume_force_settle(s)
         self.clear_copy_failure(s)
         self.record_attempt(s, started, 0, summary["files"], summary["bytes"], base,
                             "recovered from staging; " + detail)
@@ -1444,9 +2016,13 @@ class Engine(object):
         """00 F8 steps 5, 5b, 5c.  Raises CopyFailure with rc=-1 for any engine-side rejection
         (rsync itself returned 0, so -1 is used to make "the attempt failed" unambiguous in
         last_copy.rc and therefore in P4)."""
+        _tp = time.time()
         psum = summarize_tree(src, want_inodes=True)
+        self.tmark("walk_primary_src", _tp)          # COLD: primary volume, ~2.5 ms/entry probed
         replica_base = os.path.join(self.replica_snapdir, base) if base else None
+        _tp = time.time()
         ssum = summarize_tree(staging, dedup_base=replica_base)
+        self.tmark("walk_staging", _tp)              # WARM: rsync just wrote this tree
 
         if (psum["files"], psum["bytes"], psum["listing_md5"]) != \
            (ssum["files"], ssum["bytes"], ssum["listing_md5"]):
@@ -1475,9 +2051,12 @@ class Engine(object):
         repaired = 0
         if base is not None:
             pbase = os.path.join(self.primary_snapdir, base)
+            _tp = time.time()
             base_inodes = inode_map(pbase)
+            self.tmark("walk_primary_base", _tp)     # COLD: the prime suspect for the real cost
             changed = [rel for rel, ino in psum["inodes"].items()
                        if rel in base_inodes and base_inodes[rel] != ino]
+            _tp = time.time()
             violators = []
             for rel in changed:
                 try:
@@ -1487,9 +2066,12 @@ class Engine(object):
                     continue
                 if a == b:
                     violators.append(rel)
+            self.tmark("audit_changed_stats", _tp)    # 2 stats per CHANGED file (normally tiny)
             if violators:
                 violators.sort()
+                _tp = time.time()
                 repaired = self.repair_violators(s, src, staging, violators)
+                self.tmark("repair_violators", _tp)
                 still = []
                 for rel in violators:
                     try:
@@ -1512,7 +2094,9 @@ class Engine(object):
                     raise CopyFailure(-1, "inode audit: %d file(s) still hold stale bytes after "
                                           "repair, first: %s" % (len(bad), bad[0]))
                 # re-verify the listing after a repair pass touched the tree
+                _tp = time.time()
                 ssum = summarize_tree(staging, dedup_base=replica_base)
+                self.tmark("reverify_after_repair", _tp)
                 if (psum["files"], psum["bytes"], psum["listing_md5"]) != \
                    (ssum["files"], ssum["bytes"], ssum["listing_md5"]):
                     raise CopyFailure(-1, "verify mismatch after inode-audit repair")
@@ -1525,7 +2109,7 @@ class Engine(object):
         # 2026-08-19: `-H` IS NOT SHIPPED; the engine reconstructs the groups itself).
         # The primary's inode map is ground truth: two relpaths inside S sharing one inode are
         # provably the same bytes and MUST share one inode on the replica, or the split propagates
-        # forward through every later --link-dest as cumulative inode/space drift (P7).
+        # forward through every later --link-dest as cumulative, permanent inode/space waste.
         # Strictly stronger than -H: it also SELF-HEALS a group an earlier pass (or an earlier
         # engine, or a -H-less copy) left split, which -H only does when rsync elects to relink.
         # A group still split after reconstruction is a hard verify failure (post-condition below).
@@ -1585,7 +2169,9 @@ class Engine(object):
                      "inode map" % (s, relinked))
             # relinking changes nlink and can move a path off the base inode, so the 5c evidence
             # below must be recomputed rather than reused from before the repair
+            _tp = time.time()
             ssum = summarize_tree(staging, dedup_base=replica_base)
+            self.tmark("reverify_after_relink", _tp)
             # STAGING-MUTATION INVARIANT (G2): staging was just mutated, so the listing is
             # re-asserted before `ssum` is allowed to become the manifest.  Sibling of the
             # "verify mismatch after inode-audit repair" check above.
@@ -1605,14 +2191,30 @@ class Engine(object):
         # such group inside a wholly un-deduplicated snapshot supplies nlink>1 by itself.
         if link_dest is not None:
             if not ssum["linked_to_base"]:
-                raise CopyFailure(
-                    -1, "dedup assertion FAILED: link_dest=%s was in effect but NO staged file "
-                        "shares an inode with the base - the link-dest silently did nothing "
-                        "(00 F8.5c / 01 C3). For the record the staged tree does have %d file(s) "
-                        "with nlink>1, which is exactly why that test alone is not the assertion "
-                        "(C7)." % (link_dest, ssum["nlink_gt1"]))
-            detail_bits.append("dedup ok (shares inode(s) with base; nlink>1: %d)"
-                               % ssum["nlink_gt1"])
+                mark = self.skip_dedup.get(s)
+                if mark is not None:
+                    # Operator override (monitor.py POST /api/control/skip-dedup), NOT a routine
+                    # exception -- this deliberately does not touch step 5's content verification
+                    # (file count/bytes/listing_md5 above), which still applies in full. Only the
+                    # "at least one shared inode" heuristic is exempted, and only for a stamp a
+                    # human or agent explicitly marked. Consumed (one-time) by the caller once
+                    # promotion actually succeeds -- see copy_stamp().
+                    self.log("copy %s: dedup assertion SKIPPED by operator override (%s)"
+                             % (s, mark.get("reason") or "no reason given"))
+                    detail_bits.append(
+                        "dedup assertion SKIPPED by operator override (reason: %s) - staged tree "
+                        "has %d file(s) with nlink>1; content verify (step 5) still passed in full"
+                        % (mark.get("reason") or "none given", ssum["nlink_gt1"]))
+                else:
+                    raise CopyFailure(
+                        -1, "dedup assertion FAILED: link_dest=%s was in effect but NO staged file "
+                            "shares an inode with the base - the link-dest silently did nothing "
+                            "(00 F8.5c / 01 C3). For the record the staged tree does have %d file(s) "
+                            "with nlink>1, which is exactly why that test alone is not the assertion "
+                            "(C7)." % (link_dest, ssum["nlink_gt1"]))
+            else:
+                detail_bits.append("dedup ok (shares inode(s) with base; nlink>1: %d)"
+                                   % ssum["nlink_gt1"])
         if repaired:
             self.note("inode audit repaired %d stale-hardlink file(s) in %s (FINDINGS F2 window)"
                       % (repaired, s))
@@ -1643,8 +2245,14 @@ class Engine(object):
         """00 F8 step 6: manifest, THEN rename, THEN event.  The ordering is load-bearing."""
         # C12: fingerprint the VERIFIED staging tree before it is published.  This is the only
         # moment the engine can honestly record "these bytes equalled the primary".
-        samples = sample_hashes(staging, s)
+        # `summary` is the FINAL staging summary from verify_and_audit -- recomputed after every
+        # G2 mutation -- so its sample_pool describes exactly the tree that was just verified.
+        _tp = time.time()
+        samples = sample_hashes(staging, s, pool=summary.get("sample_pool"))
+        self.tmark("sample_hashes", _tp)   # now pool-fed: 200 md5s, no walk. Was walk + 200 md5s.
+        _tp = time.time()
         self.write_manifest(s, summary, base, samples)   # 6a
+        self.tmark("write_manifest", _tp)
         self.crashpoint("after_manifest")
         os.rename(staging, os.path.join(self.replica_snapdir, s))   # 6b atomic, same filesystem
         self.crashpoint("after_rename")
@@ -1740,8 +2348,50 @@ class Engine(object):
             self.event("pruned", s, "age > %d days and absent from primary" % PRUNE_AGE_DAYS)
 
     # ---------------------------------------------------------------- deep verify (00 F9)
+    # (The primary-side attribution walker lived here until 2026-08-26: it existed ONLY to
+    #  feed the P6/P7 whole-volume delta comparison and was deleted with it -- PLAN A4/F13.
+    #  Its 1-2 full primary walks per pass go with it.)
+
+    def monthly_verify_due(self, promoted_now):
+        """True when this mirror pass just promoted an early-morning stamp AND the last
+        successful sweep is at least DEEP_VERIFY_MIN_INTERVAL_HOURS old (or never ran).
+        Pure decision helper -- never raises, never writes."""
+        try:
+            early = [s for s in promoted_now
+                     if len(s) >= 13 and s[11:13].isdigit()
+                     and int(s[11:13]) in DEEP_VERIFY_EARLY_HOURS]
+            if not early:
+                return False
+            ok_ts = self.persist.get("last_deep_verify_ok_ts")
+            if not ok_ts:
+                return True
+            t = time.mktime(time.strptime(ok_ts[:19], "%Y-%m-%dT%H:%M:%S"))
+            return (time.time() - t) / 3600.0 >= DEEP_VERIFY_MIN_INTERVAL_HOURS
+        except Exception:
+            return False
 
     def deep_verify(self):
+        # RETRY-WINDOW GUARD (2026-08-26).  The nightly deep-verify used to be a single
+        # 03:15 shot that shares mirror.pid with the mirror lane, so one collision with an
+        # in-flight copy (exit 79) silently lost the ENTIRE night -- no retry, no event, no
+        # log line, and P13 stays quiet for 8 days.  That happened on 2026-08-26.
+        # The launchd job now has extra windows (03:15 / 07:15 / 15:15); this guard is what
+        # makes them retries rather than repeats, since a sweep is several full tree walks
+        # per target and must not run again just because the first window succeeded.
+        ok_ts = self.persist.get("last_deep_verify_ok_ts")
+        # SNAP_FORCE_DEEP_VERIFY=1 lets an operator run a sweep by hand before the month is up.
+        if ok_ts and os.environ.get("SNAP_FORCE_DEEP_VERIFY") != "1":
+            try:
+                t = time.mktime(time.strptime(ok_ts[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                t = None
+            if t is not None:
+                age_h = (time.time() - t) / 3600.0
+                if age_h < DEEP_VERIFY_MIN_INTERVAL_HOURS:
+                    self.log("deep-verify: skipped, last successful sweep was %.1f h ago "
+                             "(< %.0f h retry-window guard)"
+                             % (age_h, DEEP_VERIFY_MIN_INTERVAL_HOURS))
+                    return
         if not self.replica_mounted:
             self.record_deep("fail", [], "replica not mounted")
             return
@@ -1891,7 +2541,150 @@ class Engine(object):
         if text not in self.notes:
             self.notes.append(text)
 
+    def compute_enabled(self):
+        """On/off switch.  A manual override (written only by this engine's own "enable"/
+        "disable" mode, never by handshake.py) always wins and persists through automatic
+        handshake changes -- a deliberate pause must never be silently undone by a reconnect.
+        Absent an override, follow handshake.json (written only by handshake.py).  If that state
+        is missing or older than HANDSHAKE_STALE_SEC, FAIL OPEN: assume reachable and run
+        normally, but say so loudly.  A backup system must never silently stop protecting data
+        because its own connectivity watchdog died -- "an absent safety net is a problem, not a
+        neutral state" (00 F5 P13's own rationale, applied here to the switch itself)."""
+        override = self.control_override.get("override")
+        if override in ("on", "off"):
+            self.enabled_source = "manual"
+            return override == "on"
+        last_check = parse_ts(self.handshake.get("last_check"))
+        if last_check is None or (time.time() - last_check.timestamp()) > HANDSHAKE_STALE_SEC:
+            self.note("handshake state is missing or stale (last_check=%s) -- assuming reachable "
+                      "and running normally; the connectivity watchdog may be down"
+                      % (self.handshake.get("last_check") or "never"))
+            self.enabled_source = "handshake-stale-failopen"
+            return True
+        self.enabled_source = "handshake"
+        return bool(self.handshake.get("reachable", True))
+
+    def check_state_file_integrity(self):
+        """S11: an operator-decision state file that EXISTS but cannot be parsed must be loud.
+        read_json's silent {} default would otherwise erase every recorded decision at once
+        (one truncated muted.json and every mute ceases to exist, with no row left to miss);
+        the corrupt retry-request.json case is raised at its consume point instead, because
+        only the re-read there sees the file's current bytes."""
+        if getattr(self, "muted_parse_error", False):
+            self.problem("muted.json exists but cannot be parsed: every per-snapshot mute is "
+                         "suspended until the file is fixed or removed (%s)" % self.muted_path)
+        if getattr(self, "muted_lines_parse_error", False):
+            self.problem("muted-lines.json exists but cannot be parsed: every line mute is "
+                         "suspended until the file is fixed or removed (%s)"
+                         % self.muted_lines_path)
+
+    def check_failure_pattern(self):
+        """M1 escalation: quiet individual supersedes must still ADD UP to an alarm. Counts
+        DISTINCT stamps whose failure record -- INCLUDING superseded ones, that is the whole
+        point -- is younger than PATTERN_FAIL_WINDOW_DAYS; at PATTERN_FAIL_MIN the operator
+        learns even though each individual failure was quietly closed by a later success.
+        "P4 PATTERN" shares P4's mutable prefix, so problem_is_muted() excludes it explicitly,
+        exactly like "P4 SYSTEMIC"; supersede never touches it (it is derived, not stored)."""
+        fails = self.persist.get("failed_copies") or {}
+        recent = set()
+        for k, v in fails.items():
+            dt = parse_ts(v.get("ts")) if isinstance(v, dict) else None
+            if dt is not None:
+                age_days = (time.time() - dt.timestamp()) / 86400.0
+            else:
+                try:
+                    age_days = stamp_age_days(k)   # record ts unusable: date the stamp itself
+                except ValueError:
+                    continue
+            if age_days <= PATTERN_FAIL_WINDOW_DAYS:
+                recent.add(k)
+        if len(recent) >= PATTERN_FAIL_MIN:
+            self.problem("P4 PATTERN: %d distinct stamps failed to copy within %d days (%s) - "
+                         "each may have been superseded by a later success, but this many in a "
+                         "week is a recurring fault, not noise; check the log before trusting "
+                         "the green board"
+                         % (len(recent), PATTERN_FAIL_WINDOW_DAYS, ", ".join(sorted(recent))))
+
+    def check_manifest_ledger(self):
+        """M6 tripwire -- the one irreplaceable thing the deleted P6/P7 volume-delta used to
+        cover: deletion of a promoted snapshot OUT FROM UNDER the engine (e.g. an rm on the
+        DAS of a replica-only stamp whose primary copy is long pruned -- nothing else would
+        ever notice). Every top-level manifests/<stamp>.json is a standing promise "this stamp
+        was promoted and lives on the replica"; prune() moves a pruned stamp's manifest into
+        manifests/pruned/, so a top-level manifest whose replica dir is GONE means the dir was
+        deleted outside the engine. Volume-class: the problem's code word ("promoted") is not
+        in MUTABLE_CODES so a per-snapshot mute can never silence it, and supersede cannot
+        touch it. Runs only while the replica is mounted -- an unmounted volume must never
+        read as a deletion. Set-difference on listings already in hand; zero extra I/O beyond
+        one listdir of the local manifests/ dir."""
+        if not self.replica_mounted:
+            return
+        try:
+            names = os.listdir(self.manifest_dir)
+        except OSError:
+            return
+        replica = set(self.replica_snapshots)
+        staged = set(getattr(self, "incoming", None) or [])
+        primary = set(self.primary_snapshots)
+        for n in sorted(names):
+            if not n.endswith(".json") or not STAMP_RE.match(n[:-5]):
+                continue
+            s = n[:-5]
+            if s in replica:
+                continue
+            if s in staged:
+                continue    # promote crash window (manifest written, rename pending):
+                            # try_recover_staging() owns this case, not the tripwire
+            if self.primary_mounted and s not in primary \
+                    and stamp_age_days(s) > PRUNE_AGE_DAYS:
+                # Consistent with a COMPLETED prune whose manifest move failed (prune() logs
+                # that OSError): finish the bookkeeping move instead of false-alarming forever.
+                # Bookkeeping-only -- no snapshot data is touched.
+                try:
+                    os.makedirs(self.pruned_manifest_dir, exist_ok=True)
+                    os.replace(self.manifest_path(s),
+                               os.path.join(self.pruned_manifest_dir, s + ".json"))
+                    self.log("manifest ledger: moved stale manifest for pruned %s to pruned/" % s)
+                    continue
+                except OSError:
+                    pass
+            self.problem("promoted snapshot %s is MISSING from the replica "
+                         "(deleted outside the engine)" % s)
+
+    def _newer_healthy_promote_exists(self, s):
+        """F2's alternative guard for the defensive last-copy P4 fallback, health-gated per
+        M1: True iff a promoted replica stamp newer than `s` exists whose manifest passes the
+        supersede health gate (a void newer promote must not quiet the fallback)."""
+        for cand in sorted(getattr(self, "replica_snapshots", None) or [], reverse=True):
+            if cand <= s:
+                return False
+            man = self.read_manifest(cand)
+            files = man.get("files") if isinstance(man, dict) else None
+            if self.supersede_health_ok(files, exclude=cand):
+                return True
+        return False
+
     def compute_health(self):
+        self.check_state_file_integrity()
+        if not self.enabled:
+            # On/off switch: paused. Only checks that matter regardless of pause state run --
+            # everything about "is copying keeping up" (P4/P10/P14/P15) is suppressed,
+            # since falling behind is the deliberate, expected state while paused, not a fault.
+            self.note("backup system is PAUSED (%s) -- new snapshots will not be copied until "
+                      "re-enabled" % self.enabled_source)
+            if not self.primary_mounted:
+                self.problem("P1 primary volume not mounted (%s missing)" % self.primary_snapdir)
+            if not self.replica_mounted:
+                self.problem("P1 replica volume not mounted (%s missing)" % self.replica_snapdir)
+            min_kb = self.min_free_gb * 1024 * 1024
+            for label, mounted, st in (("primary", self.primary_mounted, self.stat_primary),
+                                       ("replica", self.replica_mounted, self.stat_replica)):
+                if mounted and st["free_kb"] < min_kb:
+                    self.problem("P8 %s volume has only %.1f GB free (< %.0f GB)"
+                                 % (label, st["free_kb"] / 1048576.0, self.min_free_gb))
+            self.check_wipe_alarm()   # P9 -- arguably MORE important while paused: verify isn't running either
+            self.check_manifest_ledger()   # M6 -- same reasoning as P9: deletion detection never pauses
+            return
         # P1
         if not self.primary_mounted:
             self.problem("P1 primary volume not mounted (%s missing)" % self.primary_snapdir)
@@ -1914,10 +2707,14 @@ class Engine(object):
                 if age_cal >= PRIMARY_STALE_DAYS:
                     self.problem("P3 newest primary snapshot %s is %d calendar day(s) old"
                                  % (newest, age_cal))
-        # P4 : PER-STAMP, because the copy loop continues past a failure and a later success must
-        # never bury an earlier one.  "Not yet superseded by a success" = a success of THAT stamp.
+        # P4 : PER-STAMP, because the copy loop continues past a failure and a later success of a
+        # DIFFERENT stamp must never bury an earlier one -- except by the sanctioned A1 route:
+        # a record closed as superseded_by a later HEALTH-GATED success is history, not an open
+        # failure, so P4 derives only from the still-open records.
         self.gc_copy_failures()
-        fails = self.persist.get("failed_copies") or {}
+        all_fails = self.persist.get("failed_copies") or {}
+        fails = dict((k, v) for k, v in all_fails.items()
+                     if not (isinstance(v, dict) and v.get("superseded_by")))
         if fails:
             stamps = sorted(fails)
             oldest = fails[stamps[0]]
@@ -1930,10 +2727,16 @@ class Engine(object):
                              % (len(stamps), ", ".join(stamps), stamps[0], oldest.get("rc"),
                                 oldest.get("detail") or ""))
         elif self.last_copy and self.last_copy.get("rc") != 0:
-            # defensive: a failed attempt with no ledger entry (state predating the ledger)
-            self.problem("P4 most recent copy attempt (%s) did not succeed: rc=%s %s"
-                         % (self.last_copy.get("snapshot"), self.last_copy.get("rc"),
-                            self.last_copy.get("detail") or ""))
+            # defensive: a failed attempt with no OPEN ledger entry (state predating the ledger).
+            # F2 guard: after the gc backstop supersedes the record, this fallback must not
+            # resurrect the same failure -- skip when last_copy's stamp is superseded, or when a
+            # newer health-gated promote exists (the ledger-less equivalent of superseded).
+            lc_stamp = self.last_copy.get("snapshot")
+            if not (lc_stamp and (self._is_superseded(lc_stamp)
+                                  or self._newer_healthy_promote_exists(lc_stamp))):
+                self.problem("P4 most recent copy attempt (%s) did not succeed: rc=%s %s"
+                             % (self.last_copy.get("snapshot"), self.last_copy.get("rc"),
+                                self.last_copy.get("detail") or ""))
         # SYSTEMIC escalation: every stamp we tried this pass failed.  One bad snapshot is one bad
         # file; ALL of them failing is a volume-level fault (TCC, unmounted mid-pass, full disk,
         # permissions) and must not read as N independent per-stamp notes.  Requires >=2 attempts:
@@ -1943,22 +2746,16 @@ class Engine(object):
                          "is a volume-level fault, not one bad snapshot - check TCC/permissions, "
                          "that both volumes are still mounted, and free space before looking at "
                          "any individual stamp" % self.copies_attempted)
+        # P4 PATTERN (M1): counted over ALL failure records including superseded ones, so quiet
+        # per-stamp supersedes cannot hide a recurring fault.
+        self.check_failure_pattern()
         # P5
         if self.last_deep_verify and self.last_deep_verify.get("result") == "fail":
             self.problem("P5 last deep-verify FAILED: %s" % (self.last_deep_verify.get("detail")))
-        # P6 / P7 / notes-delta
-        if self.primary_mounted and self.replica_mounted and not self.mirror_running \
-                and not self.pending:
-            dkb = abs(self.stat_primary["used_kb"] - self.stat_replica["used_kb"])
-            di = abs(self.stat_primary["iused"] - self.stat_replica["iused"])
-            if dkb > USED_KB_FAIL_DELTA:
-                self.problem("P6 used-space delta between primary and replica is %d KB (> %d)"
-                             % (dkb, USED_KB_FAIL_DELTA))
-            elif dkb >= USED_KB_WARN_DELTA:
-                self.note("used-space delta between primary and replica is %d KB" % dkb)
-            if di > IUSED_FAIL_DELTA:
-                self.problem("P7 inode-count delta between primary and replica is %d (> %d)"
-                             % (di, IUSED_FAIL_DELTA))
+        # P6/P7 (whole-volume used-KB / inode-delta comparison) DELETED 2026-08-26 -- PLAN A4,
+        # owner requirement R5, both directions: the drives are mixed-use, so nothing may ever
+        # compare primary vs replica volume totals again. Per-snapshot proof (copy verify, P9,
+        # P4, deep-verify) plus check_manifest_ledger() below cover what P6/P7 actually caught.
         # P8
         min_kb = self.min_free_gb * 1024 * 1024
         for label, mounted, st in (("primary", self.primary_mounted, self.stat_primary),
@@ -1973,6 +2770,8 @@ class Engine(object):
         self.check_rate_limit_denial()
         # P9
         self.check_wipe_alarm()
+        # manifest-ledger tripwire (M6)
+        self.check_manifest_ledger()
         # P10
         now = time.time()
         for name in self.incoming:
@@ -2019,11 +2818,267 @@ class Engine(object):
                     stamp_age_hours(newest_unsettled) < ORPHAN_WARN_HOURS:
                 self.note("snapshot %s is unsettled (in progress on the MacBook)"
                           % newest_unsettled)
+        if self.refused_force_settle:
+            # Loud, not silent (00 F5's own standard): a force-settle mark that did nothing with
+            # no explanation is exactly the confusing dead-end this note exists to prevent.
+            self.note("force-settle REFUSED for %s: not proven to be a completed upload "
+                      "(never observed as primary `latest` -- may genuinely still be mid-write); "
+                      "remove the mark or wait for it to become was_latest legitimately"
+                      % ", ".join(self.refused_force_settle))
         soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft != resource.RLIM_INFINITY and soft < 1024:
             # 01 C4: RECORD, never abort.  openrsync completed a 150k-file -aH --link-dest pass at
             # ulimit -n 256, so aborting here would refuse a copy that would have succeeded.
             self.note("open-file soft limit is only %d (ENTRYPOINT raises it to 65535)" % soft)
+
+        # LAST, after every P-rule has run: an operator MUTE is applied to the finished problem
+        # set, never to the rules that build it. Keeping it terminal means a muted stamp cannot
+        # change how any check evaluates -- only whether its verdict is allowed to alarm.
+        self.gc_mutes()
+        self.apply_mutes()
+
+    # ---------------------------------------------------------------- operator mutes (permanent)
+
+    def problem_is_muted(self, text):
+        """True iff `text` is a per-stamp problem that names ONLY suppressed stamps, where
+        suppressed = muted by the operator OR superseded by a later healthy success (F4: a
+        superseded stamp's leftovers -- its forensic staging aging into P10, above all -- must
+        not re-alarm; the staging dir itself is NEVER deleted for this, it stays for forensics
+        at the bounded cost of one failed copy and dies at the stamp's normal prune/gc).
+
+        Three guards, each of which exists to stop suppression from hiding something it
+        should not:
+          1. the code must be in MUTABLE_CODES -- volume-level faults (P1/P8/P13/P14/P16, the
+             manifest-ledger tripwire...) are never mutable, no matter which stamp they happen
+             to mention;
+          2. "P4 SYSTEMIC" and "P4 PATTERN" are excluded explicitly -- both are P4 by prefix
+             but report a VOLUME-level / systemic fault (TCC, unmounted mid-pass, full disk,
+             a week of repeated failures), which is exactly the class of problem per-snapshot
+             suppression must never be able to silence;
+          3. the problem must name at least one stamp and EVERY stamp it names must be
+             suppressed -- so the multi-stamp "P4 N snapshots have failed" line stays loud
+             while even one of the snapshots it names is still live.
+        """
+        if not text:
+            return False
+        code = text.split(None, 1)[0]
+        if code not in MUTABLE_CODES:
+            return False
+        if text.startswith("P4 SYSTEMIC") or text.startswith("P4 PATTERN"):
+            return False
+        stamps = set(STAMP_FIND_RE.findall(text))
+        if not stamps:
+            return False
+        return stamps.issubset(set(self.muted) | self._superseded_set())
+
+    def gc_mutes(self):
+        """Drop mute records for snapshots that exist on NEITHER volume.
+
+        Answers "will this row ever go away?": yes, on its own. A mute is permanent for as long
+        as the snapshot exists, but once the stamp has been pruned from both sides there is
+        nothing left to mute, and keeping the row would leave a ledger entry that outlives its
+        subject forever. Same shape and the same guard as gc_copy_failures(): never run while a
+        volume is unmounted, or an unreadable disk would look like a pruned snapshot and silently
+        discard a live operator decision."""
+        if not (self.primary_mounted and self.replica_mounted):
+            return
+        if not self.muted:
+            return
+        live = set(self.primary_snapshots) | set(self.replica_snapshots)
+        keep = dict((k, v) for k, v in self.muted.items() if k in live)
+        if keep != self.muted:
+            gone = sorted(set(self.muted) - set(keep))
+            self.muted = keep
+            write_json(self.muted_path, keep)
+            self.log("mute: cleared for pruned snapshot(s) %s - no longer on either volume"
+                     % ", ".join(gone))
+
+    def muted_records(self):
+        """The muted set PLUS superseded failure records as one UI-ready list. Superseded rows
+        ride inside the same "muted" status list with kind="superseded" (A2) so STATUS_KEYS is
+        unchanged; every row carries kind so the UI can switch its button on it.
+
+        M9/F15: superseded rows derive ONLY from persist["failed_copies"] -- classify() never
+        runs on the lock-held heartbeat path, so classify state must never feed a status row.
+        Defensive about every input: a hand-edited entry that is not a dict still yields a
+        usable record, and everything is read via getattr so this is safe on the lock-held
+        path and under test Fakes that skip __init__.
+
+        M8/A2 (the 72-hour dropdown): every row is EMITTED; a row whose timestamp is older
+        than MUTED_ROW_HIDE_HOURS is FLAGGED "hidden": true rather than dropped, so the UI can
+        drop it while /api/control/retry and /unmute keep validating against the full list --
+        the only recovery path for a superseded stamp must not die at 3 days. A missing or
+        malformed timestamp leaves the row VISIBLE (S11/F7: visibility-safe)."""
+        primary = set(getattr(self, "primary_snapshots", None) or [])
+        replica = set(getattr(self, "replica_snapshots", None) or [])
+        now = time.time()
+
+        def hidden(ts_str):
+            dt = parse_ts(ts_str)
+            if dt is None:
+                return False
+            return (now - dt.timestamp()) > MUTED_ROW_HIDE_HOURS * 3600.0
+
+        muted = getattr(self, "muted", None) or {}
+        out = []
+        for s in sorted(muted):
+            rec = muted.get(s)
+            rec = rec if isinstance(rec, dict) else {}
+            out.append({
+                "stamp": s,
+                "kind": "muted",
+                "muted_at": rec.get("muted_at"),
+                "reason": rec.get("reason"),
+                "hidden": hidden(rec.get("muted_at")),
+                "on_primary": s in primary,
+                "on_replica": s in replica,
+            })
+        fails = (getattr(self, "persist", None) or {}).get("failed_copies") or {}
+        history = (getattr(self, "persist", None) or {}).get("retry_history") or {}
+
+        def recent_retries(s):
+            n = 0
+            for t in (history.get(s) or []):
+                dt = parse_ts(t) if isinstance(t, str) else None
+                # unparseable entries count: they can only make the cooldown stricter
+                if dt is None or (now - dt.timestamp()) <= RETRY_HISTORY_WINDOW_SEC:
+                    n += 1
+            return n
+
+        for s in sorted(fails):
+            rec = fails.get(s)
+            if not (isinstance(rec, dict) and rec.get("superseded_by")):
+                continue
+            if s in muted:
+                continue    # muted wins (F5): one row per stamp, and the mute ledger owns it
+            out.append({
+                "stamp": s,
+                "kind": "superseded",
+                "superseded_at": rec.get("superseded_at"),
+                "superseded_by": rec.get("superseded_by"),
+                "failed_at": rec.get("ts"),          # monitor's <30-min retry cooldown (M8)
+                "retry_count": recent_retries(s),    # monitor's 3-in-24h retry cooldown (M8)
+                "reason": "failed; superseded by %s" % rec.get("superseded_by"),
+                "hidden": hidden(rec.get("superseded_at")),
+                "on_primary": s in primary,
+                "on_replica": s in replica,
+            })
+        return out
+
+    @staticmethod
+    def line_key(text):
+        """Identity of a message's SHAPE, not its exact text.
+
+        Every varying part of these messages is numeric -- byte counts, hour counts, and
+        snapshot stamps (2026-08-25_180005 -> #-#-#_#). Collapsing digit runs means muting
+        "P15 snapshot X has been ... awaiting copy for 9.2 h" also mutes it at 12.7 h on the
+        next pass, which is the whole point: the operator is silencing a RECURRING message,
+        not one reading of it. Without this, a line mute would expire the moment a counter
+        ticked.
+        """
+        s = re.sub(r"[0-9]+", "#", str(text or ""))
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _active_line_mutes(self):
+        """The subset of muted_lines that is still in force. A line mute EXPIRES COMPLETELY at
+        LINE_MUTE_EXPIRY_HOURS (A2): an eternal invisible silence is the one thing worse than
+        a nagging banner, so after 72 h the note/problem returns if it is still true. F7
+        malformed-timestamp policy: a record whose muted_at is missing or unparseable counts
+        as EXPIRED here (loud-safe: stop silencing) while its ROW stays visible in
+        muted_line_records() (visibility-safe). monitor.py, the file's writer, garbage-collects
+        parseably-expired entries on its next mute-line/unmute-line POST."""
+        out = {}
+        now = time.time()
+        for k, rec in (getattr(self, "muted_lines", None) or {}).items():
+            rec_d = rec if isinstance(rec, dict) else {}
+            dt = parse_ts(rec_d.get("muted_at"))
+            if dt is None:
+                continue
+            if (now - dt.timestamp()) > LINE_MUTE_EXPIRY_HOURS * 3600.0:
+                continue
+            out[k] = rec
+        return out
+
+    def apply_mutes(self):
+        """Partition problems[]/notes[] into (still alarming, muted) -- the point of the feature.
+
+        `healthy` is computed as `not self.problems` in both build_status() and heartbeat_status(),
+        so moving a problem out of that list is precisely what lets display_state leave "fail";
+        removing a note is what lets it leave "warn". Nothing is deleted: muted_problems[] ships
+        in STATUS so the monitor can keep showing what was silenced, and the reason/timestamp live
+        in muted.json / muted-lines.json / persist's failed_copies records.
+
+        Three independent mechanisms, applied in order:
+          1. per-SNAPSHOT suppression -- per-stamp problems only, guarded by MUTABLE_CODES.
+             The suppression set is muted ∪ superseded (F4): a stamp closed by a later healthy
+             success must not re-alarm through its leftovers (P10 forensic staging above all),
+             exactly as a muted one must not. Suppression persists past the 72 h row-hide.
+          2. per-LINE mute -- anything at all, matched on line_key(). This is the one that can
+             silence a note or a stamp-less problem, and it is deliberately unrestricted: the
+             owner asked to be able to quiet ANY banner. It stays honest because every muted
+             line is listed back in STATUS with its reason, unmuting restores it instantly,
+             and the mute self-expires at 72 h (_active_line_mutes).
+        """
+        self.muted_problems = []
+        self.muted_line_hits = []
+        suppressed = set(self.muted) | self._superseded_set()
+        active_lines = self._active_line_mutes()
+        if not suppressed and not active_lines:
+            return
+
+        kept = []
+        for text in self.problems:
+            if suppressed and self.problem_is_muted(text):
+                self.muted_problems.append(text)
+            elif active_lines and self.line_key(text) in active_lines:
+                self.muted_problems.append(text)
+                self.muted_line_hits.append(self.line_key(text))
+            else:
+                kept.append(text)
+        self.problems = kept
+
+        # NOTES too, or a mute only half-works. A note naming a muted stamp (e.g. "snapshot X is
+        # unsettled (in progress on the MacBook)") keeps display_state at "warn" forever, which
+        # for a deliberately voided snapshot is the same permanent-banner trap in amber. Notes are
+        # informational by construction -- every volume-level alarm is a problem[], never a note --
+        # so dropping the ones that describe ONLY suppressed stamps cannot hide a fault. The muted
+        # ledger still shows the stamp, so nothing becomes invisible.
+        surviving = []
+        for text in self.notes:
+            stamps = set(STAMP_FIND_RE.findall(text or ""))
+            if suppressed and stamps and stamps.issubset(suppressed):
+                continue
+            if active_lines and self.line_key(text) in active_lines:
+                self.muted_line_hits.append(self.line_key(text))
+                continue
+            surviving.append(text)
+        self.notes = surviving
+
+    def muted_line_records(self):
+        """Line mutes as UI-ready records, with a live flag for the ones matching something
+        now. M8 shape parity with muted_records(): a row whose muted_at parses and is older
+        than MUTED_ROW_HIDE_HOURS ships "hidden": true (such a mute has also EXPIRED --
+        _active_line_mutes() ignores it -- and the monitor GCs the entry on its next
+        mute-line write); a missing/malformed muted_at leaves the row VISIBLE (F7: the row
+        display is visibility-safe even though the mute itself is treated as expired)."""
+        hits = set(self.muted_line_hits)
+        now = time.time()
+        out = []
+        for k in sorted(self.muted_lines):
+            rec = self.muted_lines.get(k)
+            rec = rec if isinstance(rec, dict) else {}
+            dt = parse_ts(rec.get("muted_at"))
+            hidden = (dt is not None) and \
+                (now - dt.timestamp()) > MUTED_ROW_HIDE_HOURS * 3600.0
+            out.append({
+                "key": k,
+                "sample": rec.get("sample"),      # the text as it read when muted
+                "muted_at": rec.get("muted_at"),
+                "reason": rec.get("reason"),
+                "active": k in hits,              # is it silencing something on THIS pass?
+                "hidden": hidden,
+            })
+        return out
 
     # ---------------------------------------------------------------- status (00 F4)
 
@@ -2057,6 +3112,30 @@ class Engine(object):
             "healthy": not self.problems,
             "problems": list(self.problems),
             "notes": list(self.notes),
+            "system_enabled": bool(self.enabled),
+            "enabled_source": self.enabled_source,
+            "handshake_reachable": self.handshake.get("reachable"),
+            "handshake_last_change": self.handshake.get("last_change"),
+            "control_override": self.control_override.get("override"),
+            "incomplete_uploads": list(self.incomplete),
+            # F3: a superseded record is excluded -- its stamp is never retried, so offering
+            # "Skip dedup check" for it would write a skip-dedup.json entry that
+            # consume_skip_dedup() never consumes.
+            "dedup_failures": sorted(
+                s for s, f in (self.persist.get("failed_copies") or {}).items()
+                if "dedup assertion FAILED" in (f.get("detail") or "")
+                and not f.get("superseded_by")),
+            # A muted snapshot is offered NO action but Unmute: continuing to advertise "Force
+            # resume" for a stamp the operator has explicitly voided is exactly the confusing
+            # dead-end the mute is meant to end.
+            "force_settle_candidates": sorted(
+                s for s in self.unsettled
+                if s in (self.seen.get("was_latest") or []) and s not in self.muted),
+            # Full records, not bare stamps: the UI shows WHY and WHEN each snapshot was written
+            # off, so a mute can be reviewed months later instead of being an unexplained silence.
+            "muted": self.muted_records(),
+            "muted_problems": list(self.muted_problems),
+            "muted_lines": self.muted_line_records(),
         }
         assert set(st.keys()) == set(STATUS_KEYS), "STATUS key set drifted from 00 F4"
         return st
@@ -2116,11 +3195,29 @@ class Engine(object):
         self.probe()
         self.log_mount_transition()
         self.update_seen()
+        # A3/F10 consume point: AFTER probe (volumes known), BEFORE classify (a consumed retry
+        # deletes the superseded failure record, so THIS pass's classify already re-derives the
+        # stamp into pending). Gated on both volumes mounted inside the method.
+        self.consume_retry_requests()
         self.classify()
         self.emit_detected()
 
+        # On/off switch: computed AFTER probe/classify/emit_detected (never before) so
+        # corpse-tracking's seen.json bookkeeping and status.json both stay fully accurate
+        # regardless of enabled state -- "off doesn't turn off the display," and 00 F8's own
+        # corpse-tracking rationale depends on continuous per-pass observation.
+        self.enabled = self.compute_enabled()
+
         if not (self.primary_mounted and self.replica_mounted):
             # An unmounted volume is exit 1, NEVER 0 (00 F3 / HANDOFF 4.2).  No copies, no prune.
+            self.compute_health()
+            return
+
+        if not self.enabled:
+            # Paused: skip copy/prune/deep-verify, but keep status.json honest and fresh so
+            # staleness never false-fires during a pause (mirrors mirror_running's own
+            # staleness-suppression rationale in 00 F10).
+            self.refresh_volume_stats()
             self.compute_health()
             return
 
@@ -2128,6 +3225,7 @@ class Engine(object):
             self.log("start pid=%d" % self.pid)
             self.copy_logged_start = True
 
+        promoted_now = []    # stamps promoted by THIS pass (drives the monthly deep-verify)
         if self.pending:
             # 00 F3/F10: publish an in-flight STATUS before a copy that can run for >30 minutes,
             # so the monitor shows WARN "copy in progress" instead of ageing into a false FAIL.
@@ -2160,6 +3258,13 @@ class Engine(object):
                 self.copies_attempted += 1
                 if self.copy_stamp(s):
                     self.pending.remove(s)
+                    promoted_now.append(s)
+                    # A1/F1(a): the ONE point that covers both promote paths (normal copy and
+                    # try_recover_staging both return True through copy_stamp). Health-gated
+                    # inside; purges superseded stamps from pending/pending.json (F1(b)) --
+                    # safe because this loop walks list(self.pending) ASCENDING, so every
+                    # f < s was already attempted before s promoted.
+                    self.supersede_older_failures(s)
                 else:
                     self.copies_failed += 1
                     continue
@@ -2170,9 +3275,26 @@ class Engine(object):
 
         if self.mode == "deep-verify":
             self.deep_verify()
+        elif self.mode == "mirror" and self.monthly_verify_due(promoted_now):
+            # Monthly sweep right after the early-morning copy, still holding the lock, so
+            # regular copies wait and resume on the next pass. The busy timer is restarted so
+            # P14 measures the verify itself, not copy+verify back to back.
+            self.log("deep-verify: monthly run after early-morning copy of %s"
+                     % ", ".join(promoted_now))
+            self.clear_busy()
+            self.mark_busy()
+            self.mirror_running = True
+            # Same in-flight STATUS idiom as the copy phase above: compute, publish, restore.
+            pre_problems, pre_notes = list(self.problems), list(self.notes)
+            self.compute_health()
+            self.note("monthly deep-verify in progress (backups resume when it finishes)")
+            self.write_status(True)
+            self.problems, self.notes = pre_problems, pre_notes
+            self.deep_verify()
+            self.mirror_running = False
 
         try:
-            self.incoming = sorted(os.listdir(self.staging_root))
+            self.incoming = sorted(n for n in os.listdir(self.staging_root) if not excluded(n))
         except OSError:
             self.incoming = []
         self.update_pending_tracker()     # post-copy: anything promoted has left the set
@@ -2196,6 +3318,18 @@ def selfcheck_argv_builder():
 
 def main(argv):
     mode = argv[1] if len(argv) > 1 else "mirror"
+    if mode in ("enable", "disable"):
+        # On/off switch, manual path: a dedicated forced-command key invokes this mode directly
+        # (see specs) -- writes control-override.json only, touches nothing else, no lock needed.
+        state_dir = os.environ.get("SNAP_STATE_DIR") or DEFAULT_STATE_DIR
+        path = os.path.join(state_dir, "control-override.json")
+        try:
+            write_json(path, {"override": "on" if mode == "enable" else "off",
+                               "changed_at": iso_now(), "changed_by": "manual"})
+        except (IOError, OSError) as exc:
+            sys.stderr.write("engine: FATAL: cannot write %s: %s\n" % (path, exc))
+            return 3
+        return 0
     if mode not in ("mirror", "deep-verify"):
         mode = "mirror"
     try:

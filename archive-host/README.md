@@ -14,8 +14,10 @@ and the engine is structurally incapable of passing a deletion to rsync).
 | file | role |
 |---|---|
 | `engine.py` | the replica engine — stdlib-only Python 3.9+, runs on `/usr/bin/python3` |
-| `mirror.sh` | entrypoint + allowlist dispatcher (`mirror` \| `deep-verify`); the sshd forced-command target |
-| `selftest.sh` | 430-assertion acceptance suite |
+| `mirror.sh` | entrypoint + allowlist dispatcher (`mirror` \| `deep-verify` \| `handshake` \| `probe-auth`); the sshd forced-command target |
+| `handshake.py` | ~60 s writer-reachability probe -> `handshake.json`; drives the on/off switch and upload-stall detection |
+| `control.sh` | forced-command target for a separate, narrowly-scoped key that can ONLY run `enable` / `disable` |
+| `selftest.sh` | 468-assertion acceptance suite |
 
 ## Configuration
 
@@ -29,6 +31,14 @@ Environment variables (set in the LaunchAgent or the wrapper):
 | `SNAP_LOG` | `~/Library/Logs/agent-snapshot.log` | engine log |
 | `SNAP_MIN_FREE_GB` | (engine default) | mirror free-space floor |
 | `SNAP_VERIFY_SAMPLE` | 200 | files content-hashed per deep-verify |
+| `SNAP_FORCE_DEEP_VERIFY` | unset | `1` runs an explicit `deep-verify` even inside the monthly interval guard |
+| `SNAP_MBP_HOST` | `youruser@writer-host` | (`handshake.py`) ssh target for the writer's read-only `probe-auth` |
+| `SNAP_MBP_KEY` | `~/.ssh/id_ed25519_agentsnapshot_probe` | (`handshake.py`) probe key; its writer-side `authorized_keys` line must force `probe-auth` |
+
+**Deep-verify runs monthly, inside the mirror pass that promotes the early-morning
+snapshot** (stamp hour 03-06), once the last success is 28 days old — no separate
+LaunchAgent. P13 fires at 35 days. Copies wait while it runs and resume afterwards.
+See SEMANTICS.md (c) for why, and what monthly coverage does and does not give you.
 
 Safety constants live at the top of `engine.py`, deliberately not env-tunable:
 `PRUNE_AGE_DAYS = 100` and `MAX_PRUNES_PER_PASS = 2`. **Keep `PRUNE_AGE_DAYS`
@@ -58,11 +68,14 @@ When `mirror.sh` is invoked over the replica forced-command SSH key
 | mode | max triggers | window | why these numbers |
 |---|---|---|---|
 | `mirror` | **4** | **300 s** (5 min) | The reference poll LaunchAgent uses `StartInterval` **300** — one legitimate forced `mirror` every 5 minutes (12/hour from launchd alone). Four in five minutes allows a poll plus a few retries without touching normal polling; a fifth back-to-back forced trigger is denied (exit **78**). |
-| `deep-verify` | **2** | **86400 s** (24 h) | Reference deployments run deep-verify **once daily**. Two per day allows one scheduled run plus one manual retry; a third forced deep-verify in 24 h is denied. |
+| `deep-verify` | **2** | **86400 s** (24 h) | The scheduled monthly sweep runs inside a `mirror` pass, so this lane only carries manual runs. Two per day is ample; a third forced deep-verify in 24 h is denied. |
+| `handshake` | **6** | **240 s** | Own lane, own budget: a ~60 s poll must never be denied by `mirror`'s budget, and a runaway handshake timer must never starve it. No busy-lock (a copy can hold the engine lock for hours). |
 
 Denials write `~/Library/AgentSnapshot/last-rate-limit.json`. The engine
-surfaces them as health rule **P16** on the monitor (see below). Exit **79**
-means a run is already active (busy), not spam — no history slot consumed.
+surfaces them as health rule **P16** on the monitor (see below). When a run is
+already active (busy), `mirror.sh` does not exit: it hands the pass to
+`engine.py`, whose own lock refreshes status and computes the lock-held health
+rules, then exits **2**. No history slot is consumed by a busy bounce.
 
 **Linux archive hosts** (plain cron invoking `mirror.sh` locally, no forced-command
 SSH hop) are **outside this gate**, consistent with them already being outside
@@ -151,8 +164,26 @@ cat > ~/Library/LaunchAgents/com.example.agentsnapshot.mirror.plist <<'PLIST'
 PLIST
 ```
 
-Add a second LaunchAgent for `deep-verify` on a daily `StartCalendarInterval`
-(e.g. 03:15).
+There is **no** separate deep-verify LaunchAgent: the monthly sweep runs inside
+the mirror pass (see Configuration).
+
+Add the handshake poll — the same ssh-to-localhost shape, `handshake` instead of
+`mirror`, every 60 s:
+
+```sh
+sed -e 's/agentsnapshot.mirror/agentsnapshot.handshake/' \
+    -e 's|<string>mirror</string>|<string>handshake</string>|' \
+    -e 's|<integer>300</integer>|<integer>60</integer>|' \
+    ~/Library/LaunchAgents/com.example.agentsnapshot.mirror.plist \
+    > ~/Library/LaunchAgents/com.example.agentsnapshot.handshake.plist
+```
+
+The probe key (`SNAP_MBP_KEY`) needs its own line in the **writer's**
+`authorized_keys`, forced to the read-only probe:
+`restrict,command="… snapshot-dispatch probe-auth" ssh-ed25519 AAAA… agentsnapshot-probe`.
+
+Optional remote on/off switch: a third key whose archive-host `authorized_keys`
+line forces `control.sh`, which accepts only `enable` / `disable`.
 
 Render and load the weekly replica key-rotation job from the repo template
 (Sunday 05:45 local — same slot as the writer):
@@ -179,7 +210,8 @@ restrict,command="/bin/bash '/Users/youruser/Library/AgentSnapshot/mirror.sh'" s
 ```
 
 `mirror.sh` maps `SSH_ORIGINAL_COMMAND` onto the closed allowlist
-(`mirror` | `deep-verify`; anything else safely runs `mirror`). Grant sshd
+(`mirror` | `deep-verify` | `handshake` | `probe-auth`; anything else safely
+runs `mirror`). Grant sshd
 Full Disk Access once, as on the source machine. On a Linux archive host none
 of this is needed — plain cron works.
 
@@ -215,7 +247,7 @@ breaking it fails silently, because the writer reports success either way.
 ## Verify the install
 
 ```sh
-# acceptance suite (430 assertions; uses its own scratch dir, never your volumes):
+# acceptance suite (468 assertions; uses its own scratch dir, never your volumes):
 ./selftest.sh
 # one manual pass against the real volumes:
 ssh -i ~/.ssh/id_ed25519_agentsnapshot_replica -o IdentitiesOnly=yes localhost mirror

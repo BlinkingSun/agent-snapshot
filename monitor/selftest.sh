@@ -118,7 +118,7 @@ OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
 [ "$STATE" = "fail" ] && pass "40-min-stale -> fail" || fail "40-min-stale -> expected fail, got $STATE ($OUT)"
 
-echo "[2c] AUDIT RULE: mirror_running=true, ts 40 min old (2400s > 1800) -> warn, NEVER fail"
+echo "[2c] AUDIT RULE: mirror_running=true, ts 40 min old (2400s > 1800) -> ok: NEVER fail, and a copy in flight is not a colour"
 TS40="$("$PY" -c "
 import datetime
 print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=2400)).astimezone().strftime('%Y-%m-%dT%H:%M:%S%z'))
@@ -134,8 +134,10 @@ json.dump(d, open(path, "w"))
 PYEOF
 OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
-[ "$STATE" = "warn" ] && pass "long-running copy (mirror_running=true, 40min old ts) -> warn (never fail)" \
-    || fail "long-running copy -> expected warn, got $STATE ($OUT)"
+# Latest-success-wins revision: an in-flight copy is the system doing its job; it shows as the
+# activity row/glyph, never as amber (it used to paint the board amber for much of every day).
+[ "$STATE" = "ok" ] && pass "long-running copy (mirror_running=true, 40min old ts) -> ok (never fail, never amber)" \
+    || fail "long-running copy -> expected ok, got $STATE ($OUT)"
 
 # ---------------------------------------------------------------------------
 echo "[3] healthy:false with problems[] -> fail; problems text appears in HTML"
@@ -163,7 +165,7 @@ echo "$HTML" | grep -qi "banner" \
     || fail "no banner element found in HTML"
 
 # ---------------------------------------------------------------------------
-echo "[3b] notes[] nonempty (healthy:true) -> warn"
+echo "[3b] notes[] nonempty (healthy:true) -> ok: notes are informational banner text, never a colour"
 "$PY" - "$D/state/status.json" "$(now_iso)" <<'PYEOF'
 import json, sys
 path, ts = sys.argv[1], sys.argv[2]
@@ -178,7 +180,8 @@ json.dump(d, open(path, "w"))
 PYEOF
 OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
-[ "$STATE" = "warn" ] && pass "notes[] nonempty -> warn" || fail "notes[] nonempty -> expected warn, got $STATE ($OUT)"
+[ "$STATE" = "ok" ] && pass "notes[] nonempty -> ok (every real alarm is a problem[], which goes red)" \
+    || fail "notes[] nonempty -> expected ok, got $STATE ($OUT)"
 
 # ---------------------------------------------------------------------------
 echo "[4] missing status.json -> fail, HTTP 200, page degrades (no crash)"
@@ -322,26 +325,28 @@ else
     fail "negative control did not demonstrate the expected before/after difference (vuln=$VULN_STATE real=$REAL_STATE)"
 fi
 
-echo "[10] SUPPRESS_CAP: mirror_running=true, mirror_running_seconds UNDER cap (3600s), ts stale 5000s -> still warn"
+# SUPPRESS_CAP is 12 h (43200 s): copies of large trees legitimately run ~6 h, and a monthly
+# deep-verify can run straight after one. Elapsed = mirror_running_seconds + stale_seconds.
+echo "[10] SUPPRESS_CAP: mirror_running=true, elapsed UNDER cap (3600s + 5000s stale) -> ok (suppression applies)"
 write_running_status "$(ts_ago 5000)" true 3600
 OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
-[ "$STATE" = "warn" ] && pass "under cap (3600s < 21600s) -> warn (suppression still applies)" \
-    || fail "under-cap case -> expected warn, got $STATE ($OUT)"
+[ "$STATE" = "ok" ] && pass "under cap (8600s < 43200s) -> ok (suppression still applies, in-flight is not a colour)" \
+    || fail "under-cap case -> expected ok, got $STATE ($OUT)"
 
-echo "[11] SUPPRESS_CAP BREACH (FG6 repro): mirror_running=true, mirror_running_seconds OVER cap (25000s), ts stale 2400s -> fail"
-write_running_status "$(ts_ago 2400)" true 25000
+echo "[11] SUPPRESS_CAP BREACH (FG6 repro): mirror_running=true, elapsed OVER cap (45000s + 2400s stale) -> fail"
+write_running_status "$(ts_ago 2400)" true 45000
 OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
-[ "$STATE" = "fail" ] && pass "over cap (25000s > 21600s) + stale>1800 -> fail (a copy cannot claim to run forever)" \
+[ "$STATE" = "fail" ] && pass "over cap (47400s > 43200s) + stale>1800 -> fail (a copy cannot claim to run forever)" \
     || fail "over-cap case -> expected fail, got $STATE ($OUT)"
 
 echo "[11b] SUPPRESS_CAP BREACH, but stale_seconds <= 1800 -> still NOT fail (cap alone isn't sufficient, matches the AND in the formula)"
-write_running_status "$(ts_ago 600)" true 25000
+write_running_status "$(ts_ago 600)" true 45000
 OUT="$(curl -s "$BASE/api/status")"
 STATE="$(echo "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
-[ "$STATE" = "warn" ] && pass "over cap but only 600s stale -> warn, not fail (fail needs stale_seconds>1800 too)" \
-    || fail "over-cap-but-fresh case -> expected warn, got $STATE ($OUT)"
+[ "$STATE" = "ok" ] && pass "over cap but only 600s stale -> ok, not fail (fail needs stale_seconds>1800 too)" \
+    || fail "over-cap-but-fresh case -> expected ok, got $STATE ($OUT)"
 
 echo "[12] mirror_running_seconds ABSENT (older STATUS) -> no crash; treated as no-signal (suppression preserved)"
 write_running_status "$(ts_ago 2592000)" true absent   # 30 days stale, matches FG6's scenario shape
@@ -480,6 +485,53 @@ if [ $? -eq 0 ] && grep -q "raw <,>,& count: 0 0 0" "$D/bug2_unit.log"; then
 else
     fail "BUG-2 unit check did not pass: $(cat "$D/bug2_unit.log" 2>/dev/null)"
 fi
+
+# ---------------------------------------------------------------------------
+echo "[13] on/off switch: system_enabled=false (healthy) -> display_state off; a real problem still wins"
+write_healthy_status "$(now_iso)"
+"$PY" - "$D/state/status.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["system_enabled"] = False; json.dump(d, open(p, "w"))
+PYEOF
+STATE="$(curl -s "$BASE/api/status" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
+[ "$STATE" = "off" ] && pass "paused + healthy -> off (never silently indistinguishable from ok)" \
+    || fail "paused + healthy -> expected off, got $STATE"
+"$PY" - "$D/state/status.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["healthy"] = False; d["problems"] = ["P8 free space < 50 GB on replica volume"]
+json.dump(d, open(p, "w"))
+PYEOF
+STATE="$(curl -s "$BASE/api/status" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["display_state"])')"
+[ "$STATE" = "fail" ] && pass "paused + a real problem -> fail (an alarm is never masked behind 'paused')" \
+    || fail "paused + problem -> expected fail, got $STATE"
+
+# ---------------------------------------------------------------------------
+# Only MUTE is exercised here: it never kicks the engine. UNMUTE (and skip-dedup / force-settle /
+# retry) fire an ssh kick at localhost, which a test must never do on a machine that may run the
+# real engine -- an ssh_config IdentityFile can ride along past -i / IdentitiesOnly=yes.
+echo "[14] POST /api/control/mute: validates, writes muted.json, idempotent"
+write_healthy_status "$(now_iso)"
+rm -f "$D/state/muted.json"
+RESP="$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"stamp":"2026-08-19_153705","reason":"selftest"}' "$BASE/api/control/mute")"
+echo "$RESP" | grep -q '"muted"' && pass "mute of a known stamp -> muted" || fail "mute -> unexpected response: $RESP"
+"$PY" -c "import json,sys;d=json.load(open('$D/state/muted.json'));sys.exit(0 if d['2026-08-19_153705']['reason']=='selftest' else 1)" \
+    && pass "muted.json records the stamp with its reason" || fail "muted.json missing the record"
+RESP="$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"stamp":"2026-08-19_153705"}' "$BASE/api/control/mute")"
+echo "$RESP" | grep -q 'already muted' && pass "second mute is idempotent (already muted)" \
+    || fail "second mute -> unexpected response: $RESP"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d '{"stamp":"1999-01-01_000000"}' "$BASE/api/control/mute")"
+[ "$CODE" = "409" ] && pass "mute of a stamp on neither volume -> 409" || fail "unknown stamp -> HTTP $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d '{"stamp":"not-a-stamp"}' "$BASE/api/control/mute")"
+[ "$CODE" = "400" ] && pass "malformed stamp -> 400" || fail "malformed stamp -> HTTP $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d 'garbage' "$BASE/api/control/mute")"
+[ "$CODE" = "400" ] && pass "malformed JSON body -> 400" || fail "malformed body -> HTTP $CODE"
+rm -f "$D/state/muted.json"
 
 stop_server
 

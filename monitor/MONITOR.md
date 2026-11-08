@@ -35,25 +35,45 @@ and degrades gracefully without it.
 ## Endpoints
 
 ```
-GET /                      single-page UI (inline CSS/JS, no external assets)
-GET /api/status            engine status + {stale_seconds, display_state}
-GET /api/events?n=<N>      last N events, newest first (default 50, max 500)
+GET  /                            single-page UI (inline CSS/JS, no external assets)
+GET  /api/status                  engine status + {stale_seconds, display_state, monitor_notes}
+GET  /api/events?n=<N>            last N events, newest first (default 50, max 500)
+POST /api/control/mute            {stamp, reason}  write a snapshot off (muted.json); no engine kick
+POST /api/control/unmute          {stamp}          restore it; kicks one mirror pass
+POST /api/control/mute-line       {text}           silence one banner line for <= 72 h
+POST /api/control/unmute-line     {key}            restore it
+POST /api/control/retry           {stamp}          opt a SUPERSEDED stamp back in (retry-request.json)
+POST /api/control/skip-dedup      {stamp}          one-time skip of the dedup assertion for a stamp
+POST /api/control/force-settle    {stamp}          one-time "treat as settled" for a stuck upload
 ```
 
-`display_state` is `ok` | `warn` | `fail`, computed as:
+The monitor is the **single writer** of every control file; the engine only consumes them.
+Every control validates its input (stamp shape, "stamp exists on a volume", candidate lists)
+and answers 400/409 rather than writing something the engine cannot use. `mute` deliberately
+does not kick the engine — a kick counts toward `mirror.sh`'s rate limit, so clearing a banner
+could raise P16 — and lands on the next 300 s pass. Kicks that do happen are fire-and-forget
+ssh-to-localhost with the replica key, never a blocking call.
+
+`display_state` is `ok` | `warn` | `fail` | `off`, computed as:
 
 - **fail** if `healthy == false`, or the status file is missing/unparseable, or
   `stale_seconds > 1800` while no copy is running (or a copy has claimed to be running
-  past the 6 h cap);
-- **warn** if any notes are present, a copy is in progress, or `stale_seconds > 900`;
+  past the 12 h cap: `mirror_running_seconds + stale_seconds > 43200`);
+- **off** if the engine reports `system_enabled == false` (paused on purpose, or the writer
+  is unreachable) — a real problem always outranks "off";
+- **warn** if the monitor itself cannot trust its input (`monitor_notes`, e.g. a status
+  timestamp in the future), or `stale_seconds > 900` while no copy is running;
 - **ok** otherwise.
 
-Two details worth preserving if you modify this:
+Details worth preserving if you modify this:
 
-- **A copy in flight must render `warn`, never `fail`.** A real incremental can exceed 30
-  minutes; a red monitor makes a human intervene mid-copy, which is when intervening is
-  most harmful. Staleness suppression is capped at 6 h so `fail` stays reachable for a
-  genuinely stuck copy.
+- **A copy in flight is not a colour.** It shows as the activity row and a glyph. It used to
+  render `warn`, which painted the board amber for a large part of every day while the system
+  was doing exactly its job. It must never render `fail` either: a red monitor makes a human
+  intervene mid-copy, which is when intervening is most harmful. Suppression is capped at
+  12 h so `fail` stays reachable for a genuinely stuck copy.
+- **Notes are banner text, not a colour.** The engine's contract is that every real alarm is a
+  `problems[]` entry (which goes red); `notes[]` are informational by construction.
 - **`stale_seconds` is clamped at 0 from below.** A status timestamp in the future must
   never read as maximally fresh; clock skew produced exactly that bug, and it reported
   healthy indefinitely.
@@ -78,13 +98,29 @@ Two details worth preserving if you modify this:
   "mirror_running": false, "mirror_running_seconds": 0,
   "healthy": true,        // true IFF problems == []; never true merely because code ran
   "problems": [],         // human-readable strings -> monitor shows them verbatim
-  "notes": []             // advisory -> amber
+  "notes": [],            // advisory banner text (never a colour on its own)
+  "system_enabled": true, "enabled_source": "handshake",   // on/off switch and why
+  "handshake_reachable": true, "handshake_last_change": "iso",
+  "control_override": "on",                 // manual enable/disable, if any
+  "incomplete_uploads": [], "dedup_failures": [], "force_settle_candidates": [],
+  "muted": [],            // muted + superseded rows: {stamp, kind, reason, hidden, ...}
+  "muted_problems": [],   // problems silenced by a mute -- still listed, never dropped
+  "muted_lines": []       // active per-line mutes
 }
 ```
 
 `healthy` is `true` **if and only if** `problems` is empty. It is never set true because a
 pass completed. `events.jsonl` is append-only JSONL, one object per line, with kinds
-`detected | copy_started | copied | copy_failed | verify_failed | pruned | orphan_partial | error`.
+`detected | copy_started | copied | copy_failed | verify_failed | pruned | orphan_partial |
+superseded | retry_consumed | baseless_retry | dedup_skipped | force_settled | rate_limited |
+error`.
+
+## Native window
+
+`make_app.py` builds a fixed-size WKWebView viewer. Newer page code also reports its rendered
+height to the shell via `webkit.messageHandlers.resize` so a shell that implements that
+handler can size the window to its content; the page checks the handler exists first, so the
+bundled fixed-size viewer works unchanged.
 
 ## Install
 

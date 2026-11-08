@@ -211,8 +211,11 @@ PYEOF
 
 # stamps: recent enough that P3 (newest primary stamp >= 2 calendar days old) does not fire
 TODAY=$(date +%Y-%m-%d)
-S1="${TODAY}_010000"; S2="${TODAY}_020000"; S3="${TODAY}_030000"
-S4="${TODAY}_040000"; S5="${TODAY}_050000"; S6="${TODAY}_060000"; S7="${TODAY}_070000"
+# Hours 07-13 on purpose: stamps in DEEP_VERIFY_EARLY_HOURS (03-06) make a mirror pass run the
+# monthly deep-verify itself, which every test except T42 must not trigger by accident.
+# hhmmss % 7 is still distinct per stamp (0,4,1,5,2,6,3), so fixture mtimes stay collision-free.
+S1="${TODAY}_070000"; S2="${TODAY}_080000"; S3="${TODAY}_090000"
+S4="${TODAY}_100000"; S5="${TODAY}_110000"; S6="${TODAY}_120000"; S7="${TODAY}_130000"
 OLD_D()  { date -v-"$1"d +%Y-%m-%d; }
 
 FIX() { /usr/bin/python3 "$RUN/fixture.py" "$@"; }
@@ -227,6 +230,9 @@ newroot() {
     export SNAP_PRIMARY="$ROOT/primary" SNAP_REPLICA="$ROOT/replica"
     export SNAP_STATE_DIR="$ROOT/state" SNAP_LOG="$ROOT/mirror.log"
     export SNAP_MIN_FREE_GB=0          # boot disk has <50 GB free; P8 is proven separately in T19
+    # Explicit `deep-verify` calls must always run: the monthly interval guard (28 d) would
+    # otherwise skip every sweep after the first. The guard itself is proven in T42.
+    export SNAP_FORCE_DEEP_VERIFY=1
     unset SNAP_TEST_CRASH SNAP_TEST_BOGUS_LINKDEST SNAP_TEST_INJECT_FLAG \
           SNAP_SETTLE_OVERRIDE SNAP_VERIFY_SAMPLE SSH_ORIGINAL_COMMAND 2>/dev/null
     mkdir -p "$ROOT/state"
@@ -234,7 +240,19 @@ newroot() {
     P="$SNAP_PRIMARY/snapshots"
 }
 
-ENG() { bash "$ENGDIR/mirror.sh" "$@" >"$ROOT/out.txt" 2>"$ROOT/err.txt"; RC=$?; }
+# The handshake watchdog writes handshake.json every ~60 s in production; without a fresh one the
+# engine fails open with an amber "watchdog may be down" note. Refresh it before every pass so the
+# suite tests the engine, not a dead watchdog (T41 removes it on purpose to prove the fail-open).
+fresh_handshake() {
+    [ -n "${SNAP_SELFTEST_NO_HANDSHAKE:-}" ] && return 0
+    /usr/bin/python3 - "$SNAP_STATE_DIR/handshake.json" <<'HSPY'
+import json, sys, time
+now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+json.dump({"_watch": {}, "consecutive_fail": 0, "last_change": now, "last_check": now,
+           "reachable": True}, open(sys.argv[1], "w"))
+HSPY
+}
+ENG() { fresh_handshake; bash "$ENGDIR/mirror.sh" "$@" >"$ROOT/out.txt" 2>"$ROOT/err.txt"; RC=$?; }
 
 # A cold start is `mirror` PLUS one `deep-verify`.  00 F5 P13 makes "deep-verify has never
 # completed" a PROBLEM, so a mirror-only install is legitimately red until the content safety net
@@ -283,7 +301,7 @@ head_ "T00 env-override misuse -> exit 3, nothing touched"
 newroot t00
 unset SNAP_REPLICA
 T0DIR="$ROOT/state"
-ENG mirror
+SNAP_SELFTEST_NO_HANDSHAKE=1 ENG mirror
 aeq "rc" 3 "$RC"
 ahas "stderr explains the refusal" "partial SNAP_* redirection" "$(cat "$ROOT/err.txt")"
 aeq "no status.json written" "0" "$(ls -1 "$T0DIR" 2>/dev/null | wc -l | tr -d ' ')"
@@ -323,7 +341,11 @@ want = ["schema","ts","pass_kind","engine_pid","primary_mounted","replica_mounte
  "replica_total_kb","replica_used_kb","replica_free_kb","replica_iused",
  "primary_snapshots","replica_snapshots","latest_primary","latest_replica",
  "pending","unsettled","incoming","last_copy","last_deep_verify","mirror_running",
- "mirror_running_seconds","healthy","problems","notes"]
+ "mirror_running_seconds","healthy","problems","notes",
+ # on/off switch + handshake watchdog, latest-success-wins, per-snapshot / per-line mutes
+ "system_enabled","enabled_source","handshake_reachable","handshake_last_change",
+ "control_override","incomplete_uploads","dedup_failures","force_settle_candidates",
+ "muted","muted_problems","muted_lines"]
 got = set(json.load(open(sys.argv[1])).keys())
 missing = set(want)-got; extra = got-set(want)
 print("ok" if not missing and not extra else "missing=%s extra=%s" % (sorted(missing),sorted(extra)))
@@ -665,8 +687,10 @@ aeq "unknown argv[1] maps to mirror" mirror "$(Q 'd["pass_kind"]')"
 # whole entrypoint in one screen. Pre-hardening bound was <15 lines; P16 forced-path rate limits
 # added threshold selection and admit/deny dispatch (machinery lives in snapshot-key-lib.sh).
 # probe-auth (C3 auth-only cutover gate) adds an early exit before KEY_LIB/rate limits.
-aeq "mirror.sh line count <= 61 (00 F3 audibility)" "yes" \
-    "$([ "$(wc -l < "$ENGDIR/mirror.sh" | tr -d ' ')" -le 61 ] && echo yes || echo no)"
+# The handshake lane (own rate budget, no busy-lock) and the lock-held heartbeat hand-off add
+# commented dispatch, not logic; the bound moves to 100 so it still fits a review sitting.
+aeq "mirror.sh line count <= 100 (00 F3 audibility)" "yes" \
+    "$([ "$(wc -l < "$ENGDIR/mirror.sh" | tr -d ' ')" -le 100 ] && echo yes || echo no)"
 anot "mirror.sh never execs the ssh command" "eval" "$(cat "$ENGDIR/mirror.sh")"
 
 ########################################################################################
@@ -1069,16 +1093,16 @@ ENG deep-verify
 aeq "rc after the first deep-verify" 0 "$RC"
 anot "P13 cleared" "P13" "$(Q 'd["problems"]')"
 aeq "healthy" true "$(Q 'd["healthy"]')"
-# age the recorded success past the 8-day boundary
+# age the recorded success past the 35-day boundary (monthly sweep + slack)
 /usr/bin/python3 - "$SNAP_STATE_DIR/persist.json" <<'AGEPY'
 import json, sys, datetime
 p = sys.argv[1]; d = json.load(open(p))
-d["last_deep_verify_ok_ts"] = (datetime.datetime.now() - datetime.timedelta(days=9)).strftime(
+d["last_deep_verify_ok_ts"] = (datetime.datetime.now() - datetime.timedelta(days=36)).strftime(
     "%Y-%m-%dT%H:%M:%S-0400")
 json.dump(d, open(p, "w"))
 AGEPY
 ENG mirror
-aeq "rc with a 9-day-old success" 1 "$RC"
+aeq "rc with a 36-day-old success" 1 "$RC"
 ahas "P13 fires again on age" "P13 last successful deep-verify was" "$(Q 'd["problems"]')"
 ENG deep-verify
 aeq "a fresh deep-verify clears it" 0 "$RC"
@@ -1102,11 +1126,11 @@ ENG mirror
 aeq "rc" 2 "$RC"
 aeq "mirror_running true" true "$(Q 'd["mirror_running"]')"
 anot "P14 not yet: the copy has only just started" "P14" "$(Q 'd["problems"]')"
-# backdate the busy marker past SUPPRESS_CAP (6 h)
+# backdate the busy marker past SUPPRESS_CAP (12 h)
 /usr/bin/python3 - "$SNAP_STATE_DIR/persist.json" <<'BUSYPY'
 import json, sys, datetime
 p = sys.argv[1]; d = json.load(open(p))
-d["busy_since"] = (datetime.datetime.now() - datetime.timedelta(hours=7)).strftime(
+d["busy_since"] = (datetime.datetime.now() - datetime.timedelta(hours=13)).strftime(
     "%Y-%m-%dT%H:%M:%S-0400")
 json.dump(d, open(p, "w"))
 BUSYPY
@@ -1115,8 +1139,8 @@ aeq "still skipped" 2 "$RC"
 ahas "P14 fires on the LOCK-HELD path (it cannot be starved)" \
      "P14 a copy has claimed to be running" "$(Q 'd["problems"]')"
 aeq "healthy false -> the monitor can now reach FAIL" false "$(Q 'd["healthy"]')"
-aeq "mirror_running_seconds exceeds the 6 h cap" "true" \
-    "$(Q 'd["mirror_running_seconds"] > 21600')"
+aeq "mirror_running_seconds exceeds the 12 h cap" "true" \
+    "$(Q 'd["mirror_running_seconds"] > 43200')"
 # mount rules are computed on the lock-held path too
 SNAP_PRIMARY="$ROOT/gone" ENG mirror
 aeq "still skipped" 2 "$RC"
@@ -1178,27 +1202,13 @@ aeq "pending-since recorded for s4" "true" \
     "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/pending.json" "\"$S4\" in d")"
 anot "P15 does NOT fire while pending is young" "P15" "$(Q 'd["problems"]')"
 ahas "short-lived pending stays a NOTE" "pending copy" "$(Q 'd["notes"]')"
-# A newer, GOOD stamp arrives.  Under `continue` it copies straight past the bad one - which is
-# exactly the supersede sequence 00 F5 P15 warns about, now reachable end-to-end rather than
-# constructed: last_copy becomes a SUCCESS while stamp A is still missing from the replica.
-FIX snap "$ROOT" "$S4" "$S5"
-rm -f "$P/$S5/b/unreadable.txt"        # the offending file was gone by the next backup
-FIX latest "$ROOT" "$S5"
-ENG mirror
-aeq "the good stamp copied past the bad one" "yes" "$([ -d "$R/$S5" ] && echo yes || echo no)"
-aeq "only the bad stamp remains pending" "[\"$S4\"]" "$(Q 'd["pending"]')"
-aeq "last_copy is now a SUCCESS (the supersede condition)" 0 "$(Q 'd["last_copy"]["rc"]')"
-aeq "...for the later stamp" "$S5" "$(Q 'd["last_copy"]["snapshot"]')"
-ahas "P4 is NOT buried by it - the ledger is per-stamp" "P4 snapshot $S4 failed to copy" \
-     "$(Q 'd["problems"]')"
-anot "still no P15 while young" "P15" "$(Q 'd["problems"]')"
-# --- age the pending records past the 6 h threshold
+# --- age the pending record past the 12 h threshold while S4 is still the ONLY failure
 /usr/bin/python3 - "$SNAP_STATE_DIR/pending.json" <<'AGEPY'
 import json, sys, datetime
 p = sys.argv[1]; d = json.load(open(p))
 now = datetime.datetime.now()
 for i, k in enumerate(sorted(d)):          # oldest stamp = longest pending, as in reality
-    d[k] = (now - datetime.timedelta(hours=8 - i)).strftime("%Y-%m-%dT%H:%M:%S-0400")
+    d[k] = (now - datetime.timedelta(hours=14 - i)).strftime("%Y-%m-%dT%H:%M:%S-0400")
 json.dump(d, open(p, "w"))
 AGEPY
 ENG mirror
@@ -1215,10 +1225,34 @@ aeq "pass skipped (lock held)" 2 "$RC"
 ahas "P15 STILL fires on the lock-held path" "P15 snapshot $S4" "$(Q 'd["problems"]')"
 aeq "healthy false -> monitor reaches FAIL" false "$(Q 'd["healthy"]')"
 kill "$HL_PID" 2>/dev/null; wait "$HL_PID" 2>/dev/null
-# --- records are cleared once the stamps are finally copied
-chmod 644 "$P/$S4/b/unreadable.txt"
+# --- LATEST-SUCCESS-WINS: a newer GOOD stamp arrives. Under `continue` it copies straight past
+# the bad one, and that healthy promote SUPERSEDES the older failure: "the most recent backup is
+# the most important one". S4 leaves pending and stops alarming, but stays visible as a
+# kind="superseded" row and is only retried on an explicit operator request.
+FIX snap "$ROOT" "$S4" "$S5"
+rm -f "$P/$S5/b/unreadable.txt"        # the offending file was gone by the next backup
+FIX latest "$ROOT" "$S5"
 ENG mirror
-aeq "rc after the blockage is cleared" 0 "$RC"
+aeq "the good stamp copied past the bad one" "yes" "$([ -d "$R/$S5" ] && echo yes || echo no)"
+aeq "last_copy is a SUCCESS" 0 "$(Q 'd["last_copy"]["rc"]')"
+aeq "...for the later stamp" "$S5" "$(Q 'd["last_copy"]["snapshot"]')"
+aeq "the superseded stamp leaves pending" "[]" "$(Q 'd["pending"]')"
+anot "P4 cleared by the later success" "P4" "$(Q 'd["problems"]')"
+anot "P15 cleared with it" "P15" "$(Q 'd["problems"]')"
+aeq "healthy again" true "$(Q 'd["healthy"]')"
+aeq "the failure record names what superseded it" "$S5" \
+    "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/persist.json" "d['failed_copies']['$S4']['superseded_by']")"
+aeq "superseded event recorded" "superseded:$S4" "$(EV superseded | tail -1)"
+aeq "S4 stays VISIBLE as a superseded row" "true" \
+    "$(Q "any(r.get('stamp') == '$S4' and r.get('kind') == 'superseded' for r in d['muted'])")"
+# --- an operator retry re-queues it; with the blockage gone it copies and the gap fills in
+chmod 644 "$P/$S4/b/unreadable.txt"
+printf '{"%s": {"requested_at": "selftest"}}\n' "$S4" > "$SNAP_STATE_DIR/retry-request.json"
+ENG mirror
+aeq "rc after the retry" 0 "$RC"
+aeq "retry_consumed event" "retry_consumed:$S4" "$(EV retry_consumed | tail -1)"
+aeq "retry-request.json consumed" "{}" \
+    "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/retry-request.json" 'd')"
 aeq "the gap is filled in" 5 "$(ls -1d "$R"/2* | wc -l | tr -d ' ')"
 aeq "the previously-skipped stamp is now promoted" "yes" "$([ -d "$R/$S4" ] && echo yes || echo no)"
 aeq "pending drained" "[]" "$(Q 'd["pending"]')"
@@ -1255,22 +1289,24 @@ rm -f "$P/$S5/b/unreadable.txt"        # gone by the next backup, so B and C are
 FIX snap "$ROOT" "$S5" "$S6"
 FIX latest "$ROOT" "$S6"
 ENG mirror
-aeq "rc" 1 "$RC"
+aeq "rc (A was superseded by B in the same pass)" 0 "$RC"
 # --- the replica is NOT frozen
 aeq "B was copied"  "yes" "$([ -d "$R/$S5" ] && echo yes || echo no)"
 aeq "C was copied"  "yes" "$([ -d "$R/$S6" ] && echo yes || echo no)"
 aeq "A was NOT copied" "no" "$([ -d "$R/$S4" ] && echo yes || echo no)"
 aeq "replica advanced past the bad stamp" 5 "$(ls -1d "$R"/2* | wc -l | tr -d ' ')"
 aeq "replica latest tracks the primary" "$S6" "$(Q 'd["latest_replica"]')"
-aeq "only A remains pending" "[\"$S4\"]" "$(Q 'd["pending"]')"
-# --- the skipped stamp stays LOUD
-ahas "P4 names A" "P4 snapshot $S4 failed to copy and is still missing" "$(Q 'd["problems"]')"
-aeq "healthy false" false "$(Q 'd["healthy"]')"
+aeq "A left pending (superseded, not retried every pass)" "[]" "$(Q 'd["pending"]')"
+# --- latest-success-wins: the skipped stamp is closed, quiet, and still on the record
+anot "no P4 for a superseded stamp" "P4" "$(Q 'd["problems"]')"
+aeq "healthy" true "$(Q 'd["healthy"]')"
 aeq "copy_failed event for A" "copy_failed:$S4" "$(EV copy_failed | tail -1)"
-aeq "A is recorded in the per-stamp failure ledger" "true" \
-    "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/persist.json" "\"$S4\" in d[\"failed_copies\"]")"
-aeq "a later SUCCESS did not bury the earlier failure" "$S6" "$(Q 'd["last_copy"]["snapshot"]')"
-aeq "...and last_copy shows that success" 0 "$(Q 'd["last_copy"]["rc"]')"
+aeq "A's failure record is closed by the FIRST later success (B)" "$S5" \
+    "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/persist.json" "d['failed_copies']['$S4']['superseded_by']")"
+aeq "A stays visible as a superseded row" "true" \
+    "$(Q "any(r.get('stamp') == '$S4' and r.get('kind') == 'superseded' for r in d['muted'])")"
+aeq "last_copy is the newest success" "$S6" "$(Q 'd["last_copy"]["snapshot"]')"
+aeq "...and shows rc 0" 0 "$(Q 'd["last_copy"]["rc"]')"
 # --- A never becomes a --link-dest base
 anot "A is not a promoted stamp" "$S4" "$(Q 'd["replica_snapshots"]')"
 aeq "B linked against the last GOOD promoted stamp, not A" "$S3" \
@@ -1279,21 +1315,14 @@ aeq "C linked against B" "$S5" \
     "$(grep -o "copy $S6: rsync -a --link-dest=.*/$S5 " "$SNAP_LOG" >/dev/null && echo "$S5" || echo MISSING)"
 aeq "dedup survived the gap (unchanged file shared with s3)" "$(ino "$R/$S3/b/f08.txt")" \
     "$(ino "$R/$S6/b/f08.txt")"
-# --- P15 still fires for the stuck stamp
-/usr/bin/python3 - "$SNAP_STATE_DIR/pending.json" <<'AGEPY'
-import json, sys, datetime
-p = sys.argv[1]; d = json.load(open(p))
-old = (datetime.datetime.now() - datetime.timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%S-0400")
-for k in d: d[k] = old
-json.dump(d, open(p, "w"))
-AGEPY
+anot "NOT the systemic escalation - only one stamp failed" "SYSTEMIC" "$(Q 'd["problems"]')"
+# --- a superseded stamp is NOT retried on its own: another pass leaves it alone
 ENG mirror
-ahas "P15 fires for the stuck stamp" "P15 snapshot $S4 has been settled and awaiting copy" \
-     "$(Q 'd["problems"]')"
-ahas "P4 still on it too" "P4 snapshot $S4" "$(Q 'd["problems"]')"
-anot "NOT the systemic escalation - only one stamp is failing" "SYSTEMIC" "$(Q 'd["problems"]')"
-# --- and it self-heals when the blockage clears
+aeq "still not copied without an operator request" "no" "$([ -d "$R/$S4" ] && echo yes || echo no)"
+aeq "still not pending" "[]" "$(Q 'd["pending"]')"
+# --- an operator retry fills the gap once the blockage clears
 chmod 644 "$P/$S4/b/unreadable.txt"
+printf '{"%s": {"requested_at": "selftest"}}\n' "$S4" > "$SNAP_STATE_DIR/retry-request.json"
 ENG mirror
 aeq "rc" 0 "$RC"
 aeq "A finally copied" "yes" "$([ -d "$R/$S4" ] && echo yes || echo no)"
@@ -1330,6 +1359,113 @@ chmod 644 "$P/$S5/b/no2.txt"
 ENG mirror
 aeq "full recovery" 0 "$RC"
 aeq "healthy" true "$(Q 'd["healthy"]')"
+
+########################################################################################
+head_ "T40 per-snapshot MUTE: a written-off corpse stops alarming but never becomes invisible"
+newroot t40
+build3
+coldstart
+FIX partial "$ROOT" "$S3" "$S4"
+ENG mirror                                     # S4 observed ABOVE latest: unsettled
+FIX snap "$ROOT" "$S3" "$S5"
+FIX latest "$ROOT" "$S5"                       # latest advances PAST it -> corpse
+ENG mirror
+ahas "P12 names the corpse" "P12 CORPSE on primary: $S4" "$(Q 'd["problems"]')"
+aeq "healthy false" false "$(Q 'd["healthy"]')"
+printf '{"%s": {"muted_at": "2026-01-01T00:00:00-0500", "reason": "selftest write-off"}}\n' "$S4" \
+    > "$SNAP_STATE_DIR/muted.json"
+ENG mirror
+anot "P12 left problems[]" "P12" "$(Q 'd["problems"]')"
+ahas "...into muted_problems[] (still listed, never silent)" "P12 CORPSE on primary: $S4" \
+     "$(Q 'd["muted_problems"]')"
+aeq "healthy again" true "$(Q 'd["healthy"]')"
+aeq "the muted ledger lists it with its reason" "true" \
+    "$(Q "any(r.get('stamp') == '$S4' and r.get('kind') == 'muted' for r in d['muted'])")"
+aeq "the legitimate stamp still copied" "yes" "$([ -d "$R/$S5" ] && echo yes || echo no)"
+anot "a muted stamp is never a --link-dest base" "link-dest=$R/$S4 " "$(LOGT)"
+printf '{}\n' > "$SNAP_STATE_DIR/muted.json"   # unmute
+ENG mirror
+ahas "unmute restores the alarm at once" "P12 CORPSE on primary: $S4" "$(Q 'd["problems"]')"
+
+########################################################################################
+head_ "T41 on/off switch: a dead handshake watchdog FAILS OPEN (loudly); unreachable pauses"
+newroot t41
+build3
+coldstart
+rm -f "$SNAP_STATE_DIR/handshake.json"
+export SNAP_SELFTEST_NO_HANDSHAKE=1
+FIX snap "$ROOT" "$S3" "$S4"; FIX latest "$ROOT" "$S4"
+ENG mirror
+aeq "missing watchdog state never stops backups" "yes" "$([ -d "$R/$S4" ] && echo yes || echo no)"
+aeq "enabled_source says why" "handshake-stale-failopen" "$(Q 'd["enabled_source"]')"
+ahas "and it says so out loud" "handshake state is missing or stale" "$(Q 'd["notes"]')"
+/usr/bin/python3 - "$SNAP_STATE_DIR/handshake.json" <<'HSPY'
+import json, sys, time
+now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+json.dump({"_watch": {}, "consecutive_fail": 3, "last_change": now, "last_check": now,
+           "reachable": False}, open(sys.argv[1], "w"))
+HSPY
+FIX snap "$ROOT" "$S4" "$S5"; FIX latest "$ROOT" "$S5"
+ENG mirror
+aeq "writer unreachable -> paused, nothing copied" "no" "$([ -d "$R/$S5" ] && echo yes || echo no)"
+aeq "system_enabled false" false "$(Q 'd["system_enabled"]')"
+ahas "the pause is a NOTE, not a fault" "backup system is PAUSED" "$(Q 'd["notes"]')"
+aeq "healthy while deliberately paused" true "$(Q 'd["healthy"]')"
+unset SNAP_SELFTEST_NO_HANDSHAKE
+ENG mirror                                      # fresh, reachable handshake again
+aeq "reconnect resumes copying" "yes" "$([ -d "$R/$S5" ] && echo yes || echo no)"
+
+########################################################################################
+head_ "T42 MONTHLY deep-verify: runs inside the mirror pass after an early-morning copy, then not again for 28 d"
+newroot t42
+unset SNAP_FORCE_DEEP_VERIFY                    # this test is ABOUT the interval guard
+E1="${TODAY}_020000"; E2="${TODAY}_040000"; E3="${TODAY}_050000"
+E4="${TODAY}_060000"; E5="${TODAY}_140000"     # hhmmss % 7 = 1,2,6,3,0 -> distinct mtimes
+FIX seed "$ROOT" "$E1"
+FIX snap "$ROOT" "$E1" "$E2"
+FIX latest "$ROOT" "$E2"
+ENG mirror
+aeq "a mirror pass that promoted an early stamp ran the sweep itself" 1 \
+    "$(grep -c 'deep-verify: monthly run after early-morning copy' "$SNAP_LOG" | tr -d ' ')"
+aeq "rc 0: P13 cleared in that same pass" 0 "$RC"
+aeq "pass_kind is still mirror" mirror "$(Q 'd["pass_kind"]')"
+aeq "last_deep_verify passed" pass "$(Q 'd["last_deep_verify"]["result"]')"
+# the interval guard: an explicit run within the month is a logged no-op
+ENG deep-verify
+ahas "explicit deep-verify inside the month is skipped by the guard" \
+     "deep-verify: skipped, last successful sweep was" "$(LOGT)"
+SNAP_FORCE_DEEP_VERIFY=1 ENG deep-verify
+aeq "SNAP_FORCE_DEEP_VERIFY=1 overrides the guard" 0 "$RC"
+# another early copy inside the month does NOT re-run it
+FIX snap "$ROOT" "$E2" "$E3"; FIX latest "$ROOT" "$E3"
+ENG mirror
+aeq "early copy inside the month: no second monthly run" 1 \
+    "$(grep -c 'deep-verify: monthly run after early-morning copy' "$SNAP_LOG" | tr -d ' ')"
+# age the last success past 28 d: the NEXT early copy runs it again
+age_ok_ts() {
+/usr/bin/python3 - "$SNAP_STATE_DIR/persist.json" "$1" <<'AGEPY'
+import json, sys, datetime
+p = sys.argv[1]; d = json.load(open(p))
+d["last_deep_verify_ok_ts"] = (datetime.datetime.now() - datetime.timedelta(days=int(sys.argv[2]))).strftime(
+    "%Y-%m-%dT%H:%M:%S-0400")
+json.dump(d, open(p, "w"))
+AGEPY
+}
+age_ok_ts 29
+FIX snap "$ROOT" "$E3" "$E4"; FIX latest "$ROOT" "$E4"
+ENG mirror
+aeq "29 d later, the next early copy runs the monthly sweep" 2 \
+    "$(grep -c 'deep-verify: monthly run after early-morning copy' "$SNAP_LOG" | tr -d ' ')"
+aeq "rc" 0 "$RC"
+# a NON-early copy never triggers it, even when due -- and P13 stays quiet until 35 d
+age_ok_ts 29
+FIX snap "$ROOT" "$E4" "$E5"; FIX latest "$ROOT" "$E5"
+ENG mirror
+aeq "a non-early copy never triggers the sweep" 2 \
+    "$(grep -c 'deep-verify: monthly run after early-morning copy' "$SNAP_LOG" | tr -d ' ')"
+anot "P13 quiet at 29 d (threshold 35)" "P13" "$(Q 'd["problems"]')"
+aeq "the busy timer was released after the in-pass sweep" false "$(Q 'd["mirror_running"]')"
+export SNAP_FORCE_DEEP_VERIFY=1
 
 ########################################################################################
 head_ "T19 P8 free-space floor fires"

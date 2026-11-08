@@ -3,7 +3,7 @@
 Scope: the **archive-host replica engine** (`archive-host/engine.py`), which copies dated
 snapshots from a PRIMARY DAS volume to a MIRROR DAS volume on the same machine.
 Every claim below was verified against the shipped source, and the engine's own suite
-(430 assertions) exercises each behaviour.
+(468 assertions) exercises each behaviour.
 
 Terminology: **source** = the machine being backed up. **primary** = the DAS volume the
 writer creates snapshots on. **mirror** = the second DAS volume this engine copies to.
@@ -89,7 +89,29 @@ single fault or clock error can mass-delete the mirror.
 
 ## (c) What deep-verify checks, and when
 
-`deep-verify` is a separate mode, scheduled daily (03:15 in the reference deployment).
+**When: monthly, straight after the early-morning copy.** A `mirror` pass that has just
+promoted a snapshot whose stamp hour is in `DEEP_VERIFY_EARLY_HOURS` (03-06) runs the sweep
+itself, still holding the lock, once the last successful sweep is at least
+`DEEP_VERIFY_MIN_INTERVAL_HOURS` old (28 days). Copies that arrive meanwhile simply wait —
+their passes bounce off the lock and heartbeat — and resume on the next pass, so the sweep
+never races a copy and never needs its own timer. The busy timer is restarted when the sweep
+begins, so P14 measures the sweep, not copy-plus-sweep back to back.
+
+Why not a nightly job any more: on a large tree a copy can run for hours, and at several
+backups a day the engine is busy almost continuously. A fixed nightly window then collides
+with an in-flight copy nearly every night and the safety net silently stops (it did, for nine
+days, in the reference deployment). Running it *inside* the pass that just finished the early
+copy removes the collision by construction.
+
+`deep-verify` is still available as an explicit mode. Within the month it is a logged no-op
+(the interval guard); `SNAP_FORCE_DEEP_VERIFY=1` runs a sweep by hand regardless.
+
+**Honest cost of monthly:** each run still targets the newest promoted snapshot plus the
+rotation below, but at one run a month the rotation no longer sweeps every snapshot before it
+is pruned. Monthly deep-verify is a **spot-check** of the archive, not exhaustive coverage. If
+you need every snapshot content-checked within its lifetime, lower
+`DEEP_VERIFY_MIN_INTERVAL_HOURS` and accept that the sweep will contend with copies.
+
 Per run it always targets the newest promoted snapshot, plus a **coverage-driven
 rotation** of older ones: enough are selected each pass (`ceil(older / VERIFY_SWEEP_DAYS)`,
 capped at `VERIFY_MAX_OLDER_PER_PASS`) that every promoted snapshot is content-checked at
@@ -128,8 +150,9 @@ matches the primary *at copy time*. It cannot detect bit rot afterwards, nor a c
 the mirror's base copy was already wrong while the primary's inode was unchanged.
 Scheduled content hashing is the only mechanism that catches that class, which is why it
 is a scheduled job and not an optional extra. Health rule **P13** fires if deep-verify has
-never completed, or its last success is more than 8 days old — an absent safety net is
-reported as a problem, not as a neutral state.
+never completed, or its last success is more than `DEEP_VERIFY_MAX_AGE_DAYS` (35) days old —
+a monthly sweep plus slack. An absent safety net is reported as a problem, not as a neutral
+state.
 
 ---
 
@@ -144,15 +167,103 @@ reported as a problem, not as a neutral state.
   waiting for the next poll. The entrypoint must therefore behave correctly when invoked
   with **no arguments** — that is the contract with the writer, and breaking it fails
   silently, because the writer reports success either way.
-- **Deep verify:** daily, separate LaunchAgent.
+- **Deep verify:** monthly, inside the mirror pass that promotes the early-morning snapshot
+  (see (c)). No separate LaunchAgent.
+- **Handshake:** a ~60 s poll (`mirror.sh handshake` -> `handshake.py`) probes whether the
+  writer is reachable and records it in `handshake.json`; see (f). It has its own rate-limit
+  lane and deliberately takes no busy-lock, so a long copy never blinds it.
 - **Concurrency:** a single `flock` held for the process lifetime. Overlapping passes exit
   2 without copying. The kernel releases the lock if the holder dies (including SIGKILL or
   power loss), so there is no stale-lock heuristic to go wrong.
+- **Lock-held heartbeat:** a pass that finds the lock held does NOT exit silently. The
+  entrypoint hands the busy case to `engine.py`, whose own flock refreshes `status.json`
+  (`ts`, `mirror_running: true`) and computes the lock-held health subset (P1/P13/P14/P15)
+  before exiting 2. Without this, a healthy multi-hour copy aged into a false stale-FAIL at
+  minute 30, and those rules were starved for the whole copy.
+- **Long-run caps:** P14 (a copy/sweep claiming to run longer than `SUPPRESS_CAP_SECONDS`)
+  and P15 (a settled snapshot still uncopied after `PENDING_MAX_SECONDS`) are both **12 h**.
+  Copies of large trees legitimately take ~6 h, and a monthly sweep can follow one.
 
 A legacy calendar schedule (e.g. 03:00/13:00 twice-daily) is a valid alternative to
 interval polling, but note that calendar-only scheduling with `RunAtLoad=false` leaves the
 replica idle from a reboot until the next scheduled hour. Interval + RunAtLoad is
 recommended for exactly that reason.
+
+---
+
+## (e) Latest success wins — and nothing becomes invisible
+
+**The most recent backup is the most important one.** When a snapshot fails to copy, the
+copy loop continues past it (one bad snapshot costs exactly that snapshot, never every later
+one) and it raises **P4**. When a LATER snapshot then promotes healthily, that success
+**supersedes** the earlier failure: the failed stamp leaves `pending`, P4/P15 clear, and the
+board returns to green with no operator action.
+
+Safeguards, so supersede can never hide a real fault:
+- **Health-gated.** A promote only supersedes if its verified file count is at least
+  `SUPERSEDE_HEALTH_FRACTION` (0.5) of the median of the last `SUPERSEDE_HEALTH_MANIFESTS` (7)
+  manifests. A void or nearly-empty snapshot cannot clear anyone's alarm.
+- **Never invisible.** The superseded stamp stays in STATUS as a `kind: "superseded"` row
+  (its failure record keeps `superseded_by` / `superseded_at`), and a `superseded` event is
+  logged. Rows older than 72 h are flagged `hidden` for display only; they stay in the data.
+- **Opt back in.** An operator retry (`retry-request.json`, written by the monitor and
+  consumed by the engine at the start of a pass) deletes the superseded record so the stamp
+  re-enters `pending` that same pass. Consumes are counted in `retry_history` for the
+  monitor's cooldown.
+- **Patterns stay loud.** "P4 PATTERN" (3 distinct failed stamps within 7 days) and
+  "P4 SYSTEMIC" (every pending stamp failing at once) are volume-level and can be neither
+  superseded nor muted.
+
+**Per-snapshot mute.** `muted.json` (written only by the monitor) writes a snapshot off on
+purpose — a deliberately voided backup, or a corpse left by a writer run that died. A muted
+stamp leaves `pending`, is never retried, is never a `--link-dest` base, and its per-stamp
+problems move from `problems[]` to `muted_problems[]`, so `healthy` can return to true. Only
+`P4/P9/P10/P11/P12/P15` are mutable, and a problem must name ONLY muted stamps — a
+volume-level fault can never be muted. A mute lands on the next pass (the monitor does not
+kick the engine for it). Unmuting restores the alarm immediately. **Per-line mutes**
+(`muted-lines.json`) can silence any banner line and expire completely after 72 h.
+
+**Mixed-use volumes.** Only `<volume>/snapshots` is cloned or watched. The old whole-volume
+used-space / inode-count delta rules (P6/P7) were removed: on a volume that also holds other
+data they are structurally meaningless. A manifest-ledger tripwire covers the one thing they
+uniquely caught — a snapshot deleted from the mirror only.
+
+---
+
+## (f) On/off switch and the writer handshake
+
+`handshake.py` probes the writer with a dedicated, forced-command-restricted key that can
+only run the writer's read-only `probe-auth` mode, and records `reachable` / `last_check` in
+`handshake.json`. When the writer is unreachable (travelling, asleep, off the network), the
+engine **pauses**: no copies, a calm note, `system_enabled: false`, and the monitor shows
+"off" — not a failure. A real problem always outranks "off".
+
+If `handshake.json` is missing or older than `HANDSHAKE_STALE_SEC` (180 s), the engine
+**fails open**: it runs normally and says so out loud ("the connectivity watchdog may be
+down"). A backup system must never silently stop protecting data because its own watchdog
+died.
+
+A **manual override** (`engine.py enable` / `disable`, reachable remotely only through the
+narrowly-scoped `control.sh` forced command) always wins over the handshake and persists
+through reconnects, so a deliberate pause is never silently undone.
+
+---
+
+## (g) Self-healing fallbacks worth knowing about
+
+- **Unreadable basis -> one baseless copy.** openrsync aborts the whole copy (rc 11) when an
+  entry in the `--link-dest` basis changed type (for example a symlink replaced by a regular
+  file); because base selection is deterministic, every retry would hit the same entry. The
+  engine retries ONCE with no `--link-dest`. That stamp forgoes dedup; once it promotes it
+  becomes the next base and dedup returns on the following copy.
+- **Manifest-less bases are re-verified before use.** A promoted snapshot with no manifest
+  (state predating manifests, or a lost state dir) is re-verified against the primary and its
+  manifest backfilled before it may serve as a `--link-dest` base.
+- **The writer's change sidecar is not consumed.** The writer publishes
+  `snapshots/.changes/<stamp>.json` after each snapshot. The engine does not read it: a
+  sidecar-driven fast path was built and rolled back, because `rsync -a --link-dest` already
+  writes only changed files and the fast path added full-tree walks rather than removing them.
+  Every copy takes the full, verified path.
 
 ---
 
