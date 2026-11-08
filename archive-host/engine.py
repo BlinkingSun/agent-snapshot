@@ -92,7 +92,7 @@ VERIFY_SWEEP_DAYS = 90        # every promoted snapshot must be content-verified
                               # snapshots age out unverified.  See deep_verify().
 VERIFY_MAX_OLDER_PER_PASS = 8 # cost ceiling: each older target is a full two-sided walk plus
                               # sampled hashing (~2-3 min on a 146k-file snapshot over USB).
-PRUNE_AGE_DAYS = 100          # 00 F8: 90-day MacBook retention + 10 days of margin.  Do not lower.
+PRUNE_AGE_DAYS = 100          # 00 F8: 90-day writer retention + 10 days of margin.  Do not lower.
 MAX_PRUNES_PER_PASS = 2       # 00 F8: a mass rm -rf is never one bug away.
 MIN_FREE_GB_DEFAULT = 50      # 00 F5 P8 / HANDOFF 4.8
 # P6/P7 (whole-volume used-KB / inode delta) were DELETED 2026-08-26 (PLAN A4, owner R4+R5):
@@ -1231,7 +1231,7 @@ class Engine(object):
         # C9 BOOTSTRAP RECONCILIATION.  seen.json absent or empty means either the very first pass
         # after install, or that the file was lost/restored.  Either way the first-observation
         # exception (00 F8) would otherwise grandfather EVERY existing stamp as settled, including a
-        # corpse the MacBook left behind before this engine ever ran.  So: seed above_latest from
+        # corpse the writer left behind before this engine ever ran.  So: seed above_latest from
         # the CURRENT primary listing FIRST, before anything is treated as known.  The loop below
         # already does exactly that; this block makes it a named, logged, tested behaviour rather
         # than an emergent one, and records when the bootstrap happened for forensics.
@@ -1282,7 +1282,7 @@ class Engine(object):
             else:
                 # BOOTSTRAP FROM NOTHING.  Honest limit, stated rather than papered over: a corpse
                 # that `latest` has ALREADY advanced past is indistinguishable from an ordinary old
-                # snapshot, because `latest` is the MacBook's only completion signal and it no
+                # snapshot, because `latest` is the writer's only completion signal and it no
                 # longer points anywhere useful.  Prior observation is the only discriminator and
                 # by definition we have none.
                 self.note("corpse tracking is bootstrapping from NOTHING (no seen.json and no "
@@ -1343,7 +1343,7 @@ class Engine(object):
         for s in self.primary_snapshots:
             if s in marked_incomplete:
                 # On/off switch: handshake.py positively marked this stamp incomplete (connection
-                # to the MacBook was lost mid-write and the dir stopped growing). Invisible to
+                # to the writer was lost mid-write and the dir stopped growing). Invisible to
                 # pending/corpses/orphan_partial by design -- "incomplete is not a failure."
                 self.incomplete.append(s)
                 continue
@@ -1422,7 +1422,7 @@ class Engine(object):
             if s not in orphaned:
                 self.event("orphan_partial", s,
                            "CORPSE: seen above latest, never was latest, latest has advanced "
-                           "past it - a MacBook backup run died mid-write; never copied (P12)")
+                           "past it - a writer backup run died mid-write; never copied (P12)")
                 orphaned.add(s)
                 changed = True
         if self.orphan_partial and self.orphan_partial not in orphaned:
@@ -2493,7 +2493,7 @@ class Engine(object):
                     return False, "content read failed on %s: %s" % (rel, exc)
                 sampled += 1
         else:
-            # C12: the primary copy is gone (pruned at 90 days by the MacBook).  The stored manifest
+            # C12: the primary copy is gone (pruned at 90 days by the writer).  The stored manifest
             # sample is the ONLY thing that can still catch replica-side bit rot here - the listing
             # comparison above cannot see a same-size content change.
             stored = (man or {}).get("samples") or {}
@@ -2804,7 +2804,7 @@ class Engine(object):
         # P12
         for s in self.corpses:
             self.problem("P12 CORPSE on primary: %s was seen above `latest`, never was `latest`, "
-                         "and `latest` has advanced past it. A MacBook backup run died mid-write "
+                         "and `latest` has advanced past it. A writer backup run died mid-write "
                          "and left a truncated snapshot dir. NEVER copied." % s)
         # notes
         if self.pending:
@@ -2816,7 +2816,7 @@ class Engine(object):
             newest_unsettled = self.unsettled[-1]
             if newest_unsettled not in self.corpses and \
                     stamp_age_hours(newest_unsettled) < ORPHAN_WARN_HOURS:
-                self.note("snapshot %s is unsettled (in progress on the MacBook)"
+                self.note("snapshot %s is unsettled (in progress on the writer)"
                           % newest_unsettled)
         if self.refused_force_settle:
             # Loud, not silent (00 F5's own standard): a force-settle mark that did nothing with
@@ -3038,7 +3038,7 @@ class Engine(object):
         self.problems = kept
 
         # NOTES too, or a mute only half-works. A note naming a muted stamp (e.g. "snapshot X is
-        # unsettled (in progress on the MacBook)") keeps display_state at "warn" forever, which
+        # unsettled (in progress on the writer)") keeps display_state at "warn" forever, which
         # for a deliberately voided snapshot is the same permanent-banner trap in amber. Notes are
         # informational by construction -- every volume-level alarm is a problem[], never a note --
         # so dropping the ones that describe ONLY suppressed stamps cannot hide a fault. The muted

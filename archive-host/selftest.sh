@@ -138,7 +138,7 @@ def seed(root, stamp):
 def snap(root, prev, new, f2window=False, change=True):
     P = pdir(root)
     os.makedirs(os.path.join(P, new))
-    # the MacBook's writer spelling (dest-relative); the ENGINE is frozen on the absolute form
+    # the writer's spelling (dest-relative); the ENGINE is frozen on the absolute form
     # NOTE (subtask 02 CONTRACT PROBLEM C6): `-aH --link-dest` ABORTS openrsync (rc 16,
     # io_buffer_buf assertion) on any tree carrying an intra-source hardlink pair followed by
     # another regular file.  `-a --link-dest` does not, and still preserves a pre-existing pair
@@ -905,7 +905,7 @@ FIX seed "$ROOT" "$S1"
 FIX snap "$ROOT" "$S1" "$S2"
 FIX latest "$ROOT" "$S2"          # exactly 2 promoted stamps => the rotating older target IS S1
 coldstart
-rm -rf "$P/$S1"                       # simulate the MacBook's 90-day retention removing it
+rm -rf "$P/$S1"                       # simulate the writer's 90-day retention removing it
 SNAP_VERIFY_SAMPLE=all ENG deep-verify
 aeq "rc" 1 "$RC"
 ahas "P9 alarm (primary-only-loss guard) fires first" "P9 replica-only stamp $S1" "$(Q 'd["problems"]')"
@@ -982,7 +982,7 @@ head_ "T26 pre-existing corpse + seen.json lost -> still caught (C9 bootstrap gu
 newroot t26
 build3
 coldstart
-# a MacBook run dies mid-write, leaving a truncated stamp above `latest`
+# a writer run dies mid-write, leaving a truncated stamp above `latest`
 FIX partial "$ROOT" "$S3" "$S6"
 # ...and the engine's corpse memory is destroyed (disk repair, restore-from-backup, human rm)
 rm -f "$SNAP_STATE_DIR/seen.json"
@@ -1015,7 +1015,7 @@ coldstart
 aeq "manifest stores content samples" "true" \
     "$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/manifests/$S1.json" 'len(d["samples"]) > 0')"
 SAMPLED=$(/usr/bin/python3 "$RUN/q.py" "$SNAP_STATE_DIR/manifests/$S1.json" 'len(d["samples"])')
-rm -rf "$P/$S1"                   # the MacBook's 90-day retention removes the primary copy
+rm -rf "$P/$S1"                   # the writer's 90-day retention removes the primary copy
 SNAP_VERIFY_SAMPLE=all ENG deep-verify
 aeq "deep-verify passes on the pruned-primary stamp" pass "$(Q 'd["last_deep_verify"]["result"]')"
 ahas "it used the stored samples" "sampled" "$(Q 'd["last_deep_verify"]["detail"]')"

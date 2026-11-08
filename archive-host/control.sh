@@ -5,7 +5,7 @@
 # defaults any unrecognized mode to "mirror"), which defeats the point of a narrowly-scoped key.
 # $SSH_ORIGINAL_COMMAND is matched against a closed allowlist and is NEVER executed as a shell
 # command -- anything outside {enable, disable} is refused, matching snapshot-dispatch's own
-# refusal idiom (exit 77) on the MacBook side of this same system.
+# refusal idiom (exit 77) on the writer side of this same system.
 here=$(cd -- "$(dirname -- "$0")" && pwd -P) || exit 3
 mode="${SSH_ORIGINAL_COMMAND:-}"
 case "$mode" in

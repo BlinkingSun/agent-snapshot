@@ -931,11 +931,11 @@ INDEX_HTML = """<!doctype html>
       renderBanner("warn", shownLines);
     } else if (state === "off") {
       shownLines = plain.concat(monitorNotes);
-      if (!shownLines.length) shownLines = ["Paused \u2014 waiting for the MacBook to reconnect"];
+      if (!shownLines.length) shownLines = ["Paused \u2014 waiting for the writer to reconnect"];
       renderBanner("off", shownLines);
     } else {
       // OK is not the same as "nothing to say". humanNotes() emits a progress sentence ONLY
-      // when something is actually in flight (copy running / MacBook writing / stamps queued),
+      // when something is actually in flight (copy running / writer writing / stamps queued),
       // so this cannot print a reassuring lie while idle -- an empty result still clears the
       // banner exactly as before. What it fixes: before 2026-08-26 the ok branch discarded
       // `plain` outright, so once a running copy stopped forcing the board amber there was
@@ -1199,14 +1199,14 @@ INDEX_HTML = """<!doctype html>
     // these three are replaced wholesale by the single progress sentence below
     /^a copy is in progress/,
     /^copy in progress: /,
-    /^snapshot .* is unsettled \(in progress on the MacBook\)/,
-    /^[0-9]+ snapshot\(s\) pending copy: /
+    /^snapshot .* is unsettled \\(in progress on the writer\\)/,
+    /^[0-9]+ snapshot\\(s\\) pending copy: /
   ];
 
   // Plain rewrites for notes that DO matter to the owner.
   var NOTE_REWRITE = [
-    [/^backup system is PAUSED/, "Paused — waiting for the MacBook to come back on the network"],
-    [/^handshake state is missing or stale/, "Can't tell if the MacBook is reachable right now"],
+    [/^backup system is PAUSED/, "Paused — waiting for the writer to come back on the network"],
+    [/^handshake state is missing or stale/, "Can't tell if the writer is reachable right now"],
     [/^force-settle REFUSED for ([0-9_-]+)/, "Can't resume $1 yet — it isn't confirmed finished"],
     [/^orphan partial ([0-9_-]+) on the primary is ([0-9.]+) h old/,
      "An unfinished backup ($1) has been sitting for $2 hours"],
@@ -1216,9 +1216,9 @@ INDEX_HTML = """<!doctype html>
      "$1 can only be checked by file list — the original is pruned"],
     [/^corpse tracking is bootstrapping from NOTHING/,
      "Still learning which backups are complete — first run"],
-    [/^corpse-tracking state \(seen\.json\) was lost/,
+    [/^corpse-tracking state \\(seen\\.json\\) was lost/,
      "Rebuilt its record of which backups are complete"],
-    [/^previous status\.json timestamp is .* in the FUTURE/,
+    [/^previous status\\.json timestamp is .* in the FUTURE/,
      "The clock moved backwards — timestamps may be off"],
     [/^UNEXPECTED openrsync internal abort while copying ([0-9_-]+)/,
      "The copy of $1 aborted unexpectedly"]
@@ -1267,7 +1267,7 @@ INDEX_HTML = """<!doctype html>
       out.push("Copying " + (cStamp ? cStamp + " " : "") + "to the backup drive"
                + fmtElapsedSuffix(mrs + st));
     } else if (writing.length) {
-      out.push("MacBook is writing " + writing[0]
+      out.push("Writer is writing " + writing[0]
                + fmtElapsedSuffix(stampAgeSeconds(writing[0])));
     } else if (pending.length) {
       out.push(pending.length === 1
@@ -1688,7 +1688,7 @@ def _current_force_settle_candidates():
 def _kick_mirror():
     """Fire-and-forget: skip-dedup.json is only consumed on the NEXT pass, and a copy can run
     30-60+ min, so this must never block the HTTP response on it finishing -- same reasoning as
-    the MacBook's own post-snapshot kick (nohup'd, detached). The UI/caller watches /api/status
+    the writer's own post-snapshot kick (nohup'd, detached). The UI/caller watches /api/status
     afterward, exactly as it already polls for everything else."""
     try:
         subprocess.Popen(

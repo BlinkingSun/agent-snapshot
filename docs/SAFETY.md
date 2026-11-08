@@ -185,11 +185,11 @@ trustworthy):
 
 ```bash
 # browse history (it's just directories)
-ssh user@archive-host 'ls /Volumes/SnapArchive/agent-snapshot/'
+ssh user@archive-host 'ls /Volumes/SnapArchive/snapshots/'
 # restore one file from the newest snapshot
-scp 'user@archive-host:/Volumes/SnapArchive/agent-snapshot/latest/path/to/file' ./
+scp 'user@archive-host:/Volumes/SnapArchive/snapshots/latest/path/to/file' ./
 # restore a whole tree as of a date
-rsync -rlptD user@archive-host:/Volumes/SnapArchive/agent-snapshot/2026-08-20_120005/ ./restored/
+rsync -rlptD user@archive-host:/Volumes/SnapArchive/snapshots/2026-08-20_120005/ ./restored/
 # vault archive
 zstd -d < 2026-08-20_000000.tar.zst | tar -xf -
 ```

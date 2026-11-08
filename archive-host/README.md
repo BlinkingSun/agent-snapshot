@@ -32,8 +32,8 @@ Environment variables (set in the LaunchAgent or the wrapper):
 | `SNAP_MIN_FREE_GB` | (engine default) | mirror free-space floor |
 | `SNAP_VERIFY_SAMPLE` | 200 | files content-hashed per deep-verify |
 | `SNAP_FORCE_DEEP_VERIFY` | unset | `1` runs an explicit `deep-verify` even inside the monthly interval guard |
-| `SNAP_MBP_HOST` | `youruser@writer-host` | (`handshake.py`) ssh target for the writer's read-only `probe-auth` |
-| `SNAP_MBP_KEY` | `~/.ssh/id_ed25519_agentsnapshot_probe` | (`handshake.py`) probe key; its writer-side `authorized_keys` line must force `probe-auth` |
+| `SNAP_WRITER_HOST` | `youruser@writer-host` | (`handshake.py`) ssh target for the writer's read-only `probe-auth` |
+| `SNAP_WRITER_KEY` | `~/.ssh/id_ed25519_agentsnapshot_probe` | (`handshake.py`) probe key; its writer-side `authorized_keys` line must force `probe-auth` |
 
 **Deep-verify runs monthly, inside the mirror pass that promotes the early-morning
 snapshot** (stamp hour 03-06), once the last success is 28 days old — no separate
@@ -178,7 +178,7 @@ sed -e 's/agentsnapshot.mirror/agentsnapshot.handshake/' \
     > ~/Library/LaunchAgents/com.example.agentsnapshot.handshake.plist
 ```
 
-The probe key (`SNAP_MBP_KEY`) needs its own line in the **writer's**
+The probe key (`SNAP_WRITER_KEY`) needs its own line in the **writer's**
 `authorized_keys`, forced to the read-only probe:
 `restrict,command="… snapshot-dispatch probe-auth" ssh-ed25519 AAAA… agentsnapshot-probe`.
 

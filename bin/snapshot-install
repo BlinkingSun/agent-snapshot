@@ -57,6 +57,12 @@ done
 
 [ -n "$SRC" ] && [ -n "$SNAP_SSH" ] && [ -n "$SNAP_DIR" ] || {
   echo "required: --source, --snap-ssh, --snap-dir (see --help)" >&2; exit 2; }
+# The archive engine replicates only <primary volume>/snapshots; anything else
+# is backed up on the primary but never reaches the mirror drive.
+case "${SNAP_DIR%/}" in
+  */snapshots) ;;
+  *) echo "snapshot-install: WARNING --snap-dir should be <primary volume>/snapshots — the archive engine replicates only that directory (got: $SNAP_DIR)" >&2 ;;
+esac
 [ -d "$SRC" ] || { echo "source dir does not exist: $SRC" >&2; exit 2; }
 
 echo "== 1/5 installing to $APPDIR"

@@ -259,8 +259,9 @@ through reconnects, so a deliberate pause is never silently undone.
 - **Manifest-less bases are re-verified before use.** A promoted snapshot with no manifest
   (state predating manifests, or a lost state dir) is re-verified against the primary and its
   manifest backfilled before it may serve as a `--link-dest` base.
-- **The writer's change sidecar is not consumed.** The writer publishes
-  `snapshots/.changes/<stamp>.json` after each snapshot. The engine does not read it: a
+- **The writer's change sidecar is not consumed.** With `SNAP_CHANGE_SIDECAR=true` (off by
+  default) the writer publishes `snapshots/.changes/<stamp>.json` after each incremental
+  snapshot. The engine does not read it: a
   sidecar-driven fast path was built and rolled back, because `rsync -a --link-dest` already
   writes only changed files and the fast path added full-tree walks rather than removing them.
   Every copy takes the full, verified path.

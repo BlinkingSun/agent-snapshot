@@ -33,7 +33,7 @@ cd agent-snapshot
 bin/snapshot-install \
   --source "<SOURCE>" \
   --snap-ssh "<user@archive-host | localhost>" \
-  --snap-dir "<PRIMARY_VOLUME>/agent-snapshot" \
+  --snap-dir "<PRIMARY_VOLUME>/snapshots" \
   --snap-time "<HH:MM>" \
   [--vault-ssh "<user@vault-host>" --vault-os <posix|windows> \
    --vault-dir "<DIR>" --vault-time "<HH:MM>"]
@@ -178,7 +178,7 @@ ssh -i ~/.ssh/id_ed25519_agent_snapshot -o IdentitiesOnly=yes localhost snap
 ## GATE 2 — prove the snapshot exists where it should
 
 ```bash
-ssh <user@archive-host> 'ls -la <PRIMARY_VOLUME>/agent-snapshot/ | tail -5'
+ssh <user@archive-host> 'ls -la <PRIMARY_VOLUME>/snapshots/ | tail -5'
 ```
 
 Expected: one `YYYY-MM-DD_HHMMSS` directory and a `latest` symlink. Spot-check

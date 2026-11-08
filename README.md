@@ -102,7 +102,7 @@ git clone https://github.com/BlinkingSun/agent-snapshot.git && cd agent-snapshot
 bin/snapshot-install \
   --source "$HOME/Desktop" \
   --snap-ssh user@archive-host.local \
-  --snap-dir /Volumes/SnapArchive/agent-snapshot \
+  --snap-dir /Volumes/SnapArchive/snapshots \
   --snap-time 12:00
 # append the printed authorized_keys line, grant sshd Full Disk Access, then:
 ssh -i ~/.ssh/id_ed25519_agent_snapshot -o IdentitiesOnly=yes localhost probe

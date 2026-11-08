@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-SnapArchive on/off switch: mini-side connectivity handshake.
+SnapArchive on/off switch: archive-host connectivity handshake.
 
 Invoked by launchd every ~60s (com.agent-snapshot-replica.handshake, StartInterval). Each run:
-  1. Probes whether the MacBook is reachable, via a dedicated forced-command-restricted key that
-     can invoke ONLY the MacBook's existing `probe-auth` mode on snapshot-dispatch (read-only,
+  1. Probes whether the writer is reachable, via a dedicated forced-command-restricted key that
+     can invoke ONLY the writer's existing `probe-auth` mode on snapshot-dispatch (read-only,
      side-effect-free -- confirmed by reading its source before wiring this up).
   2. Debounces: requires DEBOUNCE_FAILS consecutive failed probes before flipping reachable=false,
      so one dropped packet doesn't pause the whole system.
   3. On the transition to unreachable, samples any settled-but-not-yet-observed unsettled primary
-     stamp (read from the mini's own fresh status.json -- reusing engine.py's classification
+     stamp (read from the archive host's own fresh status.json -- reusing engine.py's classification
      rather than re-implementing settle/corpse logic here) and watches it across one more poll;
      if its total size and newest mtime are BOTH unchanged, marks it incomplete in
      incomplete.json and appends a `marked_incomplete` event. If it's still growing, keeps
@@ -20,8 +20,8 @@ Invoked by launchd every ~60s (com.agent-snapshot-replica.handshake, StartInterv
 Single-writer discipline (00 F1/F8 spirit, applied to the new files): this script NEVER touches
 control-override.json (engine.py's own enable/disable mode owns that exclusively -- composing
 manual override vs. automatic handshake state is engine.py's job, so a deliberate pause is never
-silently undone by a reconnect) and NEVER writes under PRIMARY (the frozen "mini NEVER writes to
-PRIMARY. Ever." rule applies to every mini-side component, not just engine.py).
+silently undone by a reconnect) and NEVER writes under PRIMARY (the frozen "the archive host NEVER writes to
+PRIMARY. Ever." rule applies to every archive-host component, not just engine.py).
 
 stdlib only, matching engine.py/monitor.py. Env overrides mirror engine.py's SNAP_* convention so
 this can be exercised against a synthetic fixture the same way engine.py's tests are.
@@ -37,13 +37,13 @@ import time
 
 DEFAULT_PRIMARY = "/Volumes/SnapArchive"
 DEFAULT_STATE_DIR = os.path.expanduser("~/Library/AgentSnapshot")
-DEFAULT_MBP_HOST = "youruser@writer-host"  # the MacBook -- the writer host's ssh alias
-DEFAULT_MBP_KEY = os.path.expanduser("~/.ssh/id_ed25519_agentsnapshot_probe")
+DEFAULT_WRITER_HOST = "youruser@writer-host"  # the writer host's ssh target
+DEFAULT_WRITER_KEY = os.path.expanduser("~/.ssh/id_ed25519_agentsnapshot_probe")
 
 PRIMARY = os.environ.get("SNAP_PRIMARY") or DEFAULT_PRIMARY
 STATE_DIR = os.environ.get("SNAP_STATE_DIR") or DEFAULT_STATE_DIR
-MBP_HOST = os.environ.get("SNAP_MBP_HOST") or DEFAULT_MBP_HOST
-MBP_KEY = os.environ.get("SNAP_MBP_KEY") or DEFAULT_MBP_KEY
+WRITER_HOST = os.environ.get("SNAP_WRITER_HOST") or DEFAULT_WRITER_HOST
+WRITER_KEY = os.environ.get("SNAP_WRITER_KEY") or DEFAULT_WRITER_KEY
 SNAPDIR = "snapshots"
 
 HANDSHAKE_PATH = os.path.join(STATE_DIR, "handshake.json")
@@ -114,15 +114,15 @@ def append_event(kind, snapshot, detail):
 
 def probe_mbp():
     """Read-only liveness check. Uses a key whose authorized_keys forced-command on the
-    MacBook hardcodes `probe-auth` regardless of what is sent (see credential notes) -- it
-    cannot invoke `mini`/`pc` (real backup runs) no matter what this process passes."""
+    The writer's dispatcher hardcodes `probe-auth` regardless of what is sent (see credential notes) -- it
+    cannot invoke `snap`/`vault`/`both` (real backup runs) no matter what this process passes."""
     try:
         r = subprocess.run(
-            ["ssh", "-i", MBP_KEY, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            ["ssh", "-i", WRITER_KEY, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
              "-o", "StrictHostKeyChecking=yes",
              "-o", "ConnectTimeout=%d" % PROBE_TIMEOUT_SEC,
              "-o", "PreferredAuthentications=publickey",
-             MBP_HOST, "probe-auth"],
+             WRITER_HOST, "probe-auth"],
             capture_output=True, text=True, timeout=PROBE_TIMEOUT_SEC + 3,
         )
         return r.returncode == 0

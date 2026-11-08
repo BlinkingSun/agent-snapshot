@@ -17,7 +17,9 @@ SNAP_SSH="user@archive-host.local"   # single-machine mode: SNAP_SSH="localhost"
 # mid-run and strand the post-rsync finalize) and the .local name here in case
 # the IP moves. Make sure known_hosts holds the same host key for both.
 SNAP_SSH_FALLBACK=""
-SNAP_DIR="/Volumes/SnapArchive/agent-snapshot"   # on the DAS, NOT the boot disk
+SNAP_DIR="/Volumes/SnapArchive/snapshots"   # on the DAS, NOT the boot disk
+                                     # MUST be <SNAP_PRIMARY>/snapshots: the archive
+                                     # engine replicates only that directory
                                      # (absolute, or relative to the remote $HOME)
 SNAP_RETENTION=90                    # days of snapshot history kept
                                      # NOTE: the archive host's mirror prunes at
